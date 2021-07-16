@@ -1,0 +1,62 @@
+variables:
+  solution: '**/*.sln'
+  projects:  '**/Languages/**/*.csproj'
+  buildPlatform: 'Any CPU'
+  buildConfiguration: 'Release'
+
+trigger:
+  branches:
+    include:
+    - master
+  paths:
+    include:
+    - Languages
+    - azure-devops/build-models.yml
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+steps:
+- checkout: self
+  lfs: true
+
+- task: NuGetToolInstaller@1
+
+- task: UseDotNet@2
+  displayName: 'Use .NET Core sdk'
+  inputs:
+    packageType: sdk
+    version: 5.0.102
+    installationPath: $(Agent.ToolsDirectory)/dotnet
+
+- task: DotNetCoreCLI@2
+  displayName: 'restore nuget'
+  inputs:
+    command: 'restore'
+    projects: '$(projects)'
+
+- task: DotNetCoreCLI@2
+  displayName: 'build projects'
+  inputs:
+    command: 'build'
+    projects: '$(projects)'
+    arguments: '-c $(buildConfiguration) /p:Version=1.0.$(build.buildId)  /p:AllowUnsafeBlocks=True /p:LangVersion=latest'
+
+- task: DotNetCoreCLI@2
+  displayName: 'pack projects'
+  inputs:
+    command: 'pack'
+    packagesToPack: '$(projects)'
+    versioningScheme: 'off'
+    configuration: 'Release'
+    buildProperties: 'Version="1.0.$(build.buildId)";AllowUnsafeBlocks="True";LangVersion="latest"'
+    verbosityPack: 'Diagnostic'
+    nobuild: true
+
+- task: NuGetCommand@2
+  displayName: 'push nuget'
+  inputs:
+    command: 'push'
+    packagesToPush: '$(Build.ArtifactStagingDirectory)/**/*.nupkg'
+    nuGetFeedType: 'external'
+    publishFeedCredentials: 'nuget-curiosity'

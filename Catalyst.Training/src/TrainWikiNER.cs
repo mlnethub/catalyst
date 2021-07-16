@@ -18,7 +18,7 @@ namespace Catalyst.Training
     {
         private static ILogger Logger = ApplicationLogging.CreateLogger<TrainWikiNER>();
 
-        public static async Task TrainAsync(string basePath, Language language, int version, string tag)
+        public static async Task TrainAsync(string basePath, Language language, int version, string tag, string languagesDirectory)
         {
             var langMarker = "-" + Languages.EnumToCode(language) + "-";
             var files = Directory.EnumerateFiles(basePath, "*.bz2").Where(f => f.Contains(langMarker));
@@ -40,7 +40,19 @@ namespace Catalyst.Training
             var aper = new AveragePerceptronEntityRecognizer(language, version, tag, new string[] { "Person", "Organization", "Location" }, ignoreCase:false );
 
             aper.Train(documents);
+
             await aper.StoreAsync();
+
+            //Prepare model for new nuget-based distribution
+
+            var resDir = Path.Combine(languagesDirectory, language.ToString(), "Resources");
+
+            Directory.CreateDirectory(resDir);
+
+            using (var f = File.OpenWrite(Path.Combine(resDir, "wikiner.bin")))
+            {
+                await aper.StoreAsync(f);
+            }
         }
 
         private static IEnumerable<IDocument> ReadFile(string fn)

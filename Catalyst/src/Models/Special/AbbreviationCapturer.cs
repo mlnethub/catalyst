@@ -5,6 +5,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
+using System.Collections.Specialized;
 
 namespace Catalyst.Models
 {
@@ -24,8 +25,12 @@ namespace Catalyst.Models
 
     public class AbbreviationCapturer
     {
-        public int MinimumAbbreviationbLength = 2;
-        public MatchingPattern CapturePattern = new MatchingPattern(new MatchingPatternPrototype(nameof(AbbreviationCapturer)).Add(PatternUnitPrototype.Single().IsOpeningParenthesis(), PatternUnitPrototype.And(PatternUnitPrototype.ShouldNotMatch().IsOpeningParenthesis(), PatternUnitPrototype.Multiple().IsLetterOrDigit()), PatternUnitPrototype.Single().IsClosingParenthesis()));
+        public int MinimumAbbreviationLength = 2;
+        private readonly MatchingPattern _capturePattern = new MatchingPattern(new MatchingPatternPrototype(nameof(AbbreviationCapturer)).Add(PatternUnitPrototype.Single().IsOpeningParenthesis(),
+                                                                                                                                              PatternUnitPrototype.And(PatternUnitPrototype.ShouldNotMatch().IsOpeningParenthesis(), 
+                                                                                                                                              PatternUnitPrototype.Multiple(maxMatches: 5).IsLetterOrDigit()), 
+                                                                                                                                              PatternUnitPrototype.Single().IsClosingParenthesis()));
+        private static ObjectPool<StringBuilder> _stringBuilders { get; } = new ObjectPool<StringBuilder>(() => new StringBuilder(), Environment.ProcessorCount, sb => { sb.Clear(); if (sb.Capacity > 1_000_000) sb.Capacity = 0; });
 
         private static char[] Parenthesis = new[] { '(', ')', '[', ']', '{', '}' };
         private PatternUnit DiscardCommonWords;
@@ -47,23 +52,47 @@ namespace Catalyst.Models
             Stopwords = new HashSet<ulong>(StopWords.Spacy.For(Language).Select(w => w.AsSpan().IgnoreCaseHash64()).ToArray());
         }
 
-        public List<AbbreviationCandidate> ParseDocument(Document doc, Func<AbbreviationCandidate, bool> shouldSkip)
+        public List<AbbreviationCandidate> ParseDocument(Document doc, Func<AbbreviationCandidate, bool> shouldSkip = null)
         {
             var found = new List<AbbreviationCandidate>();
-            if (doc.Language != Language && doc.Language != Language.Any) { return found; }
+            if (doc.Language != Language && doc.Language != Language.Any && Language != Language.Any) { return found; }
+
+            int CountUpper(ReadOnlySpan<char> sp)
+            {
+                int count = 0;
+                foreach(var c in sp)
+                {
+                    if (char.IsUpper(c)) count++;
+                }
+                return count;
+            }
 
             foreach (var span in doc)
             {
                 var tokens = span.ToTokenSpan();
-                int N = tokens.Length - 2;
+                int N = tokens.Length - 3;
 
-                for (int i = 0; i < N; i++)
+                for (int i = 1; i < N; i++)
                 {
-                    if (CapturePattern.IsMatch(tokens.Slice(i), out var consumedTokens) && consumedTokens == 3)
+                    if (_capturePattern.IsMatch(tokens.Slice(i), out var consumedTokens) && consumedTokens > 2)
                     {
-                        var innerToken = tokens.Slice(i + 1, consumedTokens - 2)[0]; //Skips opening and closing parenthesis
+                        var slice = tokens.Slice(i + 1, consumedTokens - 2); //Skips opening and closing parenthesis
+                        Token innerToken = slice[0];
+                        int countUpper = CountUpper(innerToken.ValueAsSpan);
+
+                        foreach(var it in slice.Slice(1))
+                        {
+                            var itC = CountUpper(it.ValueAsSpan);
+                            if (itC > countUpper )
+                            {
+                                innerToken = it;
+                                countUpper = itC;
+                            }
+                        }
 
                         bool shouldDiscard = false;
+                        
+                        shouldDiscard |= innerToken.Length > 100; //Too long
                         shouldDiscard |= DiscardOnlyLowerCase.IsMatch(ref innerToken); //All lower case
                         shouldDiscard |= DiscardCommonWords.IsMatch(ref innerToken);
                         shouldDiscard |= DiscardIsSymbol.IsMatch(ref innerToken);
@@ -74,7 +103,7 @@ namespace Catalyst.Models
 
                             var lettersToMatch = innerToken.ValueAsSpan.ToArray().Where(c => char.IsUpper(c)).ToArray();
 
-                            if (lettersToMatch.Length >= MinimumAbbreviationbLength && lettersToMatch.Length > (0.5 * innerToken.Length)) //Accept abbreviations with up to 50% lower-case letters, as long as they have enough upper-case letters
+                            if (lettersToMatch.Length >= MinimumAbbreviationLength && lettersToMatch.Length > (0.5 * innerToken.Length)) //Accept abbreviations with up to 50% lower-case letters, as long as they have enough upper-case letters
                             {
                                 var matchedLetters = new bool[lettersToMatch.Length];
 
@@ -82,7 +111,7 @@ namespace Catalyst.Models
                                 int min = i - 1 - maxTokensToTry;
                                 if (min < 0) { min = 0; }
 
-                                for (int j = i - 1; j > min; j--)
+                                for (int j = i - 1; j > min; j--) // starts from i - 1 as tokens[i] is the opening parenthesis we found above
                                 {
                                     var cur = tokens[j].ValueAsSpan;
 
@@ -104,18 +133,23 @@ namespace Catalyst.Models
                                     {
                                         //Found all letters, so hopefully we have a match
                                         //Make sure now that the letters appear in sequence
-                                        var fullSpan = doc.Value.AsSpan().Slice(tokens[j].Begin, tokens[i - 1].End - tokens[j].Begin + 1);
+                                        var fullSpan = doc.Value.AsSpan().Slice(tokens[j].Begin, tokens[i].Begin - tokens[j].Begin);
+
+                                        if (AppearsIn(innerToken.ValueAsSpan, fullSpan) && !fullSpan.IsAllUpperCase())
+                                        {
+                                            break;
+                                        }
 
                                         if (IsSubSequenceOf(lettersToMatch.AsSpan(), fullSpan))
                                         {
                                             var allUpper = fullSpan.ToArray().Where(c => char.IsUpper(c)).ToList();
-                                            var allUpperAbb = new HashSet<char>(lettersToMatch);
+                                            var allUpperAbb = new List<char>(lettersToMatch);
                                             while (allUpper.Count > 0 && allUpperAbb.Count > 0)
                                             {
                                                 var c = allUpper[0];
                                                 if (allUpperAbb.Remove(c))
                                                 {
-                                                    allUpper.RemoveAt(0);
+                                                    allUpper.Remove(c);
                                                 }
                                                 else
                                                 {
@@ -124,6 +158,7 @@ namespace Catalyst.Models
                                             }
 
                                             //Only add this as an abbreviation if the abbreviation contains all candidate description upper-case letters
+
                                             if (allUpper.Count == 0)
                                             {
                                                 var context = GetContextForCandidate(doc, innerToken);
@@ -135,10 +170,17 @@ namespace Catalyst.Models
                                                     Context = context
                                                 };
 
-                                                if (!shouldSkip(candidate))
+
+                                                //Skip bad abbreviation captures of the form 'ABB ( ABB )', or when the description is too small
+                                                if (!(candidate.Description.AsSpan().IsAllUpperCase() || candidate.Description.Length < candidate.Abbreviation.Length + 5 || candidate.Abbreviation.Contains(candidate.Description)))
                                                 {
-                                                    found.Add(candidate);
+                                                    if (shouldSkip is null || !shouldSkip(candidate))
+                                                    {
+                                                        found.Add(candidate);
+                                                    }
                                                 }
+
+
                                             }
 
                                             break;
@@ -155,9 +197,28 @@ namespace Catalyst.Models
             return found;
         }
 
+        private bool AppearsIn(ReadOnlySpan<char> abbreviation, ReadOnlySpan<char> description)
+        {
+            int m = description.Length - abbreviation.Length + 1;
+            for (int i = 0; i < m; i++)
+            {
+                if(description[i] == abbreviation[0])
+                {
+                    bool found = true;
+                    for(int k = 1; k < abbreviation.Length; k++)
+                    {
+                        found &= (description[i+k] == abbreviation[k]);
+                    }
+                    if (found) return true;
+                }
+            }
+            return false;
+        }
+
         public static string GetStandardForm(ReadOnlySpan<char> fullSpan)
         {
-            var sb = new StringBuilder(fullSpan.Length);
+            var sb = _stringBuilders.Rent();
+
             bool lastWasSpace = true;
             for (int i = 0; i < fullSpan.Length; i++)
             {
@@ -184,7 +245,9 @@ namespace Catalyst.Models
                     sb.Append(fullSpan[i]); lastWasSpace = false;
                 }
             }
-            return sb.ToString();
+            var text = sb.ToString().Trim();
+            _stringBuilders.Return(sb);
+            return text;
         }
 
         public string[] GetContextForCandidate(Document doc, IToken innerToken)
@@ -244,8 +307,8 @@ namespace Catalyst.Models
     [MessagePackObject(keyAsPropertyName: true)]
     public class AbbreviationCandidate
     {
-        public string Abbreviation;
-        public string Description;
-        public string[] Context;
+        public string Abbreviation { get; set; }
+        public string Description { get; set; }
+        public string[] Context { get; set; }
     }
 }

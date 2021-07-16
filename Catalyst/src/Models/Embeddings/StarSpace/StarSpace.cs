@@ -10,44 +10,11 @@ using System.Numerics;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Diagnostics;
 
 namespace Catalyst.Models
 {
-    public class StarSpaceModel : StorableObjectData
-    {
-        public StarSpace.ModelType Type { get; set; }
-        public int ContextWindow { get; set; }
-        public bool InvariantCase { get; set; }
-        public long Epoch { get; set; } = 5;
-        public bool IsTrained { get; set; }
-        public ThreadPriority ThreadPriority { get; internal set; } = ThreadPriority.Normal;
-        public Dictionary<uint, int> EntryHashToIndex { get; set; } = new Dictionary<uint, int>();
-        public Dictionary<int, FastText.Entry> Entries { get; set; } = new Dictionary<int, FastText.Entry>();
-        public int MinimumCount { get; set; } = 1;
-        public int EntryCount { get; set; }
-        public int ThreadCount { get; set; } = Environment.ProcessorCount;
-        public bool TrainWordEmbeddings { get; set; }
-        public int BatchSize { get; set; } = 5;
-        public StarSpace.LossType LossType { get; set; } = StarSpace.LossType.Hinge;
-        public int NegativeSamplingSearchLimit { get; set; } = 50;
-        public float WordWeight { get; set; } = 0.5f;
-        public StarSpace.SimilarityType Similarity { get; set; } = StarSpace.SimilarityType.Cosine;
-        public float Margin { get; set; } = 0.05f;
-        public float LearningRate { get; set; } = 0.01f;
-        public int Dimensions { get; set; } = 128;
-        public int MaximumNegativeSamples { get; set; } = 10;
-        public bool AdaGrad { get; set; } = true;
-        public double P { get; set; } = 0.5;
-        public float InitializationStandardDeviation { get; set; } = 0.001f;
-        public bool ShareEmbeddings { get; set; } = true;
-        public int Buckets { get; internal set; } = 2_000_000;
-        public int WordNGrams { get; set; } = 1;
-        public StarSpace.InputType InputType { get; set; }
-
-        public QuantizationType VectorQuantization { get; set; } = QuantizationType.None;
-    }
-
-    public class StarSpace : StorableObject<StarSpace, StarSpaceModel>
+    public class StarSpace : StorableObject<StarSpace, StarSpaceModel>, ITrainableModel
     {
         public const char _BOW_ = '<';
         public const char _EOW_ = '>';
@@ -55,6 +22,8 @@ namespace Catalyst.Models
         public static uint _HashEOS_; //Initialized on creation, as it depends on POS being already initialized - otherwise might run into a race condition on who's created first
         private static readonly uint[] POS_Hashes = Enum.GetValues(typeof(PartOfSpeech)).Cast<PartOfSpeech>().Select(pos => (uint)Hashes.CaseSensitiveHash32(pos.ToString())).ToArray();
         private static readonly uint[] Language_Hashes = Enum.GetValues(typeof(Language)).Cast<Language>().Select(lang => (uint)Hashes.CaseSensitiveHash32(lang.ToString())).ToArray();
+
+        public TrainingHistory TrainingHistory => Data.TrainingHistory;
 
         private SharedState Shared;
 
@@ -143,7 +112,7 @@ namespace Catalyst.Models
             return deleted;
         }
 
-        public void Train(IEnumerable<IDocument> documents, Func<IToken, bool> ignorePattern = null, ParallelOptions parallelOptions = default)
+        public void Train(IEnumerable<IDocument> documents, Func<IToken, bool> ignorePattern = null, ParallelOptions parallelOptions = default, Action<TrainingUpdate> trainingStatus = null)
         {
             InputData inputData;
 
@@ -161,7 +130,7 @@ namespace Catalyst.Models
 
                 using (var m = new Measure(Logger, "Training vector model " + (Vector.IsHardwareAccelerated ? "using hardware acceleration [" + Vector<float>.Count + "]" : "without hardware acceleration"), inputData.docCount))
                 {
-                    DoTraining(inputData, cancellationToken);
+                    DoTraining(inputData, cancellationToken, trainingStatus);
                 }
             }
         }
@@ -189,7 +158,7 @@ namespace Catalyst.Models
 
                 foreach (var span in doc)
                 {
-                    var tokens = span.GetTokenized().ToArray();
+                    var tokens = span.GetCapturedTokens().ToArray();
                     var spanParse = new List<Base>();
                     for (int i = 0; i < tokens.Length; i++)
                     {
@@ -233,7 +202,7 @@ namespace Catalyst.Models
             return ID;
         }
 
-        public void DoTraining(InputData inputData, CancellationToken cancellationToken)
+        public void DoTraining(InputData inputData, CancellationToken cancellationToken, Action<TrainingUpdate> trainingStatus)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
@@ -252,6 +221,8 @@ namespace Catalyst.Models
             int impatience = 0;
             float best_valid_err = 1e9f;
 
+            var trainingHistory = new TrainingHistory();
+
             using (var m = new Measure(Logger, "Training", Data.Epoch))
             {
                 for (int epoch = 0; epoch < Data.Epoch; epoch++)
@@ -261,8 +232,10 @@ namespace Catalyst.Models
                         mps.Rate = rate;
                         mps.FinishRate = rate - decrPerEpoch;
                         mps.Epoch = epoch;
-                        var t = new Thread(() => ThreadTrain(mps));
+                        mps.TrainingHistory = epoch == 0 ? trainingHistory : null;
+                        var t = new Thread(() => ThreadTrain(mps, trainingStatus));
                         t.Priority = Data.ThreadPriority;
+                        t.IsBackground = true; // 2020-05-12 DWR: Set to background so that if work is still going on on this thread when the host app is killed, the thread doesn't hold up the shutdown
                         t.Start();
                         return t;
                     }).ToArray();
@@ -271,8 +244,9 @@ namespace Catalyst.Models
                     rate -= decrPerEpoch;
                     cancellationToken.ThrowIfCancellationRequested(); //If the training was canceled, all threads will return, so we throw here
                 }
+                trainingHistory.ElapsedTime = TimeSpan.FromSeconds(m.ElapsedSeconds);
             }
-
+            Data.TrainingHistory = trainingHistory;
             Data.IsTrained = true;
             Shared = sharedState;
         }
@@ -283,7 +257,7 @@ namespace Catalyst.Models
 
             foreach (var span in doc)
             {
-                foreach (var v in span.GetTokenized())
+                foreach (var v in span.GetCapturedTokens())
                 {
                     //if (ignorePattern is object && ignorePattern(tokens[i]))
                     //{
@@ -312,7 +286,7 @@ namespace Catalyst.Models
             //TODO: check if this is correct - not sure what this vector is supposed to be here, as we are now adding all the features to the same basket
             float[] vector = new float[Data.Dimensions];
 
-            ProjectLHS(Shared, parse, ref vector);
+            ProjectLHS(Shared, parse, vector);
 
             return vector;
         }
@@ -414,15 +388,18 @@ namespace Catalyst.Models
             }
         }
 
-        private void ThreadTrain(ThreadState state)
+        private void ThreadTrain(ThreadState state, Action<TrainingUpdate> trainingStatus)
         {
             // If we decrement after *every* sample, precision causes us to lose the update.
             int kDecrStep = 1000;
             var numSamples = state.Corpus.Length;
             var repInterval = (int)(numSamples / 20); //Reports every 5%
-
+            var sw = Stopwatch.StartNew();
             float decrPerKSample = (state.Rate - state.FinishRate) / (numSamples / kDecrStep);
             int negSearchLimit = Math.Min(numSamples, Data.NegativeSamplingSearchLimit);
+
+            var elapsedTillNow = state.TrainingHistory?.ElapsedTime ?? TimeSpan.Zero;
+
 
             //todo: access state.corpus in random order - i.e. create array of indices, shuffle and use this to index "i"
 
@@ -449,7 +426,7 @@ namespace Catalyst.Models
                     for (int j = 0; j < examples.Count; j++)
                     {
                         wordExamples.Add(examples[i]);
-                        if (wordExamples.Count >= Data.BatchSize || i == examples.Count - 1)
+                        if (wordExamples.Count >= Data.BatchSize || j == examples.Count - 1)
                         {
                             if (Data.LossType == LossType.SoftMax)
                             {
@@ -465,6 +442,7 @@ namespace Catalyst.Models
                         }
                     }
                 }
+
                 if (Data.Type != ModelType.WordEmbeddings)
                 {
                     ParseResults ex = GetExample(state, i);
@@ -493,69 +471,20 @@ namespace Catalyst.Models
                 if ((ix % kDecrStep) == (kDecrStep - 1))
                 {
                     state.Rate -= decrPerKSample;
+
+                    if (state.CancellationToken.IsCancellationRequested) return;
                 }
 
                 if (state.ThreadID == 0 && i % repInterval == 0 && state.Counts > 0)
                 {
                     var curLos = state.Loss / state.Counts;
                     state.Measure.EmitPartial($"E:{state.Epoch} P:{100f * ((float)i / numSamples):n2}% L:{curLos:n8}");
+
+                    var update = new TrainingUpdate().At(state.Epoch + ((float)i / numSamples), Data.Epoch, curLos).Processed(i, sw.Elapsed + elapsedTillNow);
+                    trainingStatus?.Invoke(update);
+                    state.TrainingHistory.Append(update);
                 }
             }
-
-            //long localTokenCount = 0;
-            //Stopwatch Watch = null;
-            //if (mps.ThreadID == 0) { Watch = Stopwatch.StartNew(); }
-            //float progress = 0f, lr = Data.LearningRate;
-
-            //float baseLR = Data.LearningRate / 200;
-
-            //float nextProgressReport = 0f;
-            //for (int epoch = 0; epoch < Data.Epoch; epoch++)
-            //{
-            //    if (mps.CancellationToken.IsCancellationRequested) { return; } //Cancelled the training, so return from the thread
-
-            //    for (int i = 0; i < mps.Corpus.Length; i++)
-            //    {
-            //        localTokenCount += mps.Corpus[i].EntryIndexes.Length;
-
-            //        switch (Data.Type)
-            //        {
-            //            case VectorModelType.CBow: { CBow(ref mps, ref mps.Corpus[i].EntryIndexes, lr); break; }
-            //            case VectorModelType.Skipgram: { Skipgram(ref mps, ref mps.Corpus[i].EntryIndexes, lr); break; }
-            //            case VectorModelType.Supervised: { Supervised(ref mps, ref mps.Corpus[i], lr); break; }
-            //            case VectorModelType.PVDM: { PVDM(ref mps, ref mps.Corpus[i], lr); break; }
-            //            case VectorModelType.PVDBow: { PVDBow(ref mps, ref mps.Corpus[i], lr); break; }
-            //        }
-
-            //        if (localTokenCount > Data.LearningRateUpdateRate)
-            //        {
-            //            progress = (float)(TokenCount) / (Data.Epoch * NumberOfTokens);
-
-            //            var x10 = (float)(TokenCount) / (10 * NumberOfTokens);
-
-            //            //lr = Data.LearningRate * (1.0f - progress);
-            //            //plot abs(cos(x))*0.98^x from x = [0,100]
-            //            //lr = (float)(baseLR + (Data.LearningRate - baseLR) * (0.5 + 0.5 * Math.Sin(100 * progress))); //Cyclic loss rate
-            //            lr = (float)(baseLR + (Data.LearningRate - baseLR) * Math.Abs(Math.Cos(200 * x10)) * Math.Pow(0.98, 100 * x10)); //Cyclic loss rate, scaled for 10 epoch
-
-            //            Interlocked.Add(ref TokenCount, localTokenCount);
-            //            Interlocked.Add(ref PartialTokenCount, localTokenCount);
-
-            //            localTokenCount = 0;
-
-            //            if (mps.ThreadID == 0 && progress > nextProgressReport)
-            //            {
-            //                nextProgressReport += 0.01f; //Report every 1%
-            //                var loss = mps.GetLoss();
-            //                var ws = (double)(Interlocked.Exchange(ref PartialTokenCount, 0)) / Watch.Elapsed.TotalSeconds;
-            //                Watch.Restart();
-            //                var wst = ws / Data.Threads;
-
-            //                Logger.LogInformation("At {PROGRESS}%, w/s/t: {WST}, w/s: {WS}, loss at epoch {EPOCH}/{MAXEPOCH}: {LOSS}", (int)(progress * 100f), (int)wst, (int)ws, epoch + 1, Data.Epoch, loss);
-            //            }
-            //        }
-            //    }
-            //}
         }
 
         private float TrainOneBatch(ThreadState state, List<ParseResults> batch_exs, int negSearchLimit, float rate0, bool trainWord)
@@ -576,8 +505,8 @@ namespace Catalyst.Models
 
             for (int i = 0; i < batch_sz; i++)
             {
-                ProjectLHS(state.Shared, batch_exs[i].LHSTokens, ref state.lhs[i]);
-                ProjectRHS(state.Shared, batch_exs[i].RHSTokens, ref state.rhsP[i]);
+                ProjectLHS(state.Shared, batch_exs[i].LHSTokens, state.lhs[i]);
+                ProjectRHS(state.Shared, batch_exs[i].RHSTokens, state.rhsP[i]);
                 posSim[i] = Similarity(ref state.lhs[i], ref state.rhsP[i]);
             }
 
@@ -594,7 +523,7 @@ namespace Catalyst.Models
                 {
                     GetRandomRHS(state, negLabels);
                 }
-                ProjectRHS(state.Shared, negLabels, ref state.rhsN[i]);
+                ProjectRHS(state.Shared, negLabels, state.rhsN[i]);
                 state.batch_negLabels.Add(negLabels);
             }
 
@@ -618,7 +547,7 @@ namespace Catalyst.Models
                     {
                         num_negs[i]++;
                         loss[i] += thisLoss;
-                        SIMD.Add(ref negMean[i], ref state.rhsN[j]);
+                        SIMD.Add(negMean[i], state.rhsN[j]);
                         update_flag[i][j] = true;
                         if (num_negs[i] == Data.MaximumNegativeSamples) { break; }
                     }
@@ -626,11 +555,11 @@ namespace Catalyst.Models
                 if (num_negs[i] == 0) { continue; }
 
                 loss[i] /= negSearchLimit;
-                SIMD.Multiply(ref negMean[i], 1f / num_negs[i]);
+                SIMD.Multiply(negMean[i], 1f / num_negs[i]);
                 total_loss += loss[i];
 
                 // gradW for i
-                SIMD.MultiplyAndAdd(ref negMean[i], ref state.rhsP[i], -1f);
+                SIMD.MultiplyAndAdd(negMean[i], state.rhsP[i], -1f);
                 for (int j = 0; j < negSearchLimit; j++)
                 {
                     if (update_flag[i][j])
@@ -666,16 +595,27 @@ namespace Catalyst.Models
         {
             var cols = Data.Dimensions;
 
-            void Update(ref float[] dest, ref float[] src, float rate, float weight, ref float[] adagradWeight, int idx)
+#if NETCOREAPP3_0 || NETCOREAPP3_1 || NET5_0
+            void Update(Span<float> dest, ReadOnlySpan<float> src, float rate, float weight, Span<float> adagradWeight, int idx)
             {
                 if (Data.AdaGrad)
                 {
                     adagradWeight[idx] += weight / cols;
                     rate /= (float)Math.Sqrt(adagradWeight[idx] + 1e-6f);
                 }
-                SIMD.MultiplyAndAdd(ref dest, ref src, -rate);
+                SIMD.MultiplyAndAdd(dest, src, -rate);
             }
-
+#else
+            void Update(float[] dest, float[] src, float rate, float weight, Span<float> adagradWeight, int idx)
+            {
+                if (Data.AdaGrad)
+                {
+                    adagradWeight[idx] += weight / cols;
+                    rate /= (float)Math.Sqrt(adagradWeight[idx] + 1e-6f);
+                }
+                SIMD.MultiplyAndAdd(dest, src, -rate);
+            }
+#endif
             var batch_sz = batch_exs.Count;
             var n1 = new float[batch_sz];
             var n2 = new float[batch_sz];
@@ -685,8 +625,8 @@ namespace Catalyst.Models
                 {
                     if (num_negs[i] > 0)
                     {
-                        n1[i] = SIMD.DotProduct(ref gradW[i], ref gradW[i]);
-                        n2[i] = SIMD.DotProduct(ref lhs[i], ref lhs[i]);
+                        n1[i] = SIMD.DotProduct(gradW[i], gradW[i]);
+                        n2[i] = SIMD.DotProduct(lhs[i], lhs[i]);
                     }
                 }
             }
@@ -700,13 +640,13 @@ namespace Catalyst.Models
                     var labels = batch_exs[i].RHSTokens;
                     foreach (var w in items)
                     {
-                        var row = state.Shared.LHSEmbeddings.GetRowRef(w.ID);
-                        Update(ref row, ref gradW[i], rate_lhs * w.Weight, n1[i], ref state.Shared.LHSUpdates, w.ID);
+                        var row = state.Shared.LHSEmbeddings.GetRow(w.ID);
+                        Update(row, gradW[i], rate_lhs * w.Weight, n1[i], state.Shared.LHSUpdates, w.ID);
                     }
                     foreach (var la in labels)
                     {
-                        var row = state.Shared.RHSEmbeddings.GetRowRef(la.ID);
-                        Update(ref row, ref lhs[i], rate_rhsP[i] * la.Weight, n2[i], ref state.Shared.RHSUpdates, la.ID);
+                        var row = state.Shared.RHSEmbeddings.GetRow(la.ID);
+                        Update(row, lhs[i], rate_rhsP[i] * la.Weight, n2[i], state.Shared.RHSUpdates, la.ID);
                     }
                 }
             }
@@ -720,8 +660,8 @@ namespace Catalyst.Models
                     {
                         foreach (var la in batch_negLabels[j])
                         {
-                            var row = state.Shared.RHSEmbeddings.GetRowRef(la.ID);
-                            Update(ref row, ref lhs[i], nRate[i][j] * la.Weight, n2[i], ref state.Shared.RHSUpdates, la.ID);
+                            var row = state.Shared.RHSEmbeddings.GetRow(la.ID);
+                            Update(row, lhs[i], nRate[i][j] * la.Weight, n2[i], state.Shared.RHSUpdates, la.ID);
                         }
                     }
                 }
@@ -782,40 +722,64 @@ namespace Catalyst.Models
             }
         }
 
-        private void ProjectRHS(SharedState state, List<Base> ws, ref float[] retval)
+#if NETCOREAPP3_0 || NETCOREAPP3_1 || NET5_0
+        private void ProjectRHS(SharedState state, List<Base> ws, Span<float> retval)
+#else
+        private void ProjectRHS(SharedState state, List<Base> ws, float[] retval)
+#endif
         {
-            Forward(ref state.RHSEmbeddings, ws, ref retval);
+            Forward(state.RHSEmbeddings, ws, retval);
             if (ws.Count > 0)
             {
-                var norm = (float)(Data.Similarity == SimilarityType.Dot ? Math.Pow(ws.Count, Data.P) : Norm2(ref retval));
-                SIMD.Multiply(ref retval, 1f / norm);
+                var norm = (float)(Data.Similarity == SimilarityType.Dot ? Math.Pow(ws.Count, Data.P) : Norm2(retval));
+                SIMD.Multiply(retval, 1f / norm);
             }
         }
 
-        private void Forward(ref Matrix matrix, List<Base> ws, ref float[] retval)
+#if NETCOREAPP3_0 || NETCOREAPP3_1 || NET5_0
+        private void Forward(Matrix matrix, List<Base> ws, Span<float> retval)
+        {
+            retval.Fill(0f);
+#else
+        private void Forward(Matrix matrix, List<Base> ws, float[] retval)
         {
             retval.Zero();
+#endif
             foreach (var b in ws)
             {
-                var row = matrix.GetRowRef(b.ID);
-                SIMD.Add(ref retval, ref row);
+                var row = matrix.GetRow(b.ID);
+                SIMD.Add(retval, row);
             }
         }
 
-        private double Norm2(ref float[] a)
+
+#if NETCOREAPP3_0 || NETCOREAPP3_1 || NET5_0
+        private double Norm2(Span<float> a)
         {
             const float Epsilon = 1.192092896e-07F;
-            var norm = (float)Math.Sqrt(SIMD.DotProduct(ref a, ref a));
+            var norm = (float)Math.Sqrt(SIMD.DotProduct(a, a));
             return (norm < Epsilon) ? Epsilon : norm;
         }
-
-        private void ProjectLHS(SharedState state, List<Base> ws, ref float[] retval)
+#else
+        private double Norm2(float[] a)
         {
-            Forward(ref state.LHSEmbeddings, ws, ref retval);
+            const float Epsilon = 1.192092896e-07F;
+            var norm = (float)Math.Sqrt(SIMD.DotProduct(a, a));
+            return (norm < Epsilon) ? Epsilon : norm;
+        }
+#endif
+
+#if NETCOREAPP3_0 || NETCOREAPP3_1 || NET5_0
+        private void ProjectLHS(SharedState state, List<Base> ws, Span<float> retval)
+#else
+        private void ProjectLHS(SharedState state, List<Base> ws, float[] retval)
+#endif
+        {
+            Forward(state.LHSEmbeddings, ws, retval);
             if (ws.Count > 0)
             {
-                var norm = (float)(Data.Similarity == SimilarityType.Dot ? Math.Pow(ws.Count, Data.P) : Norm2(ref retval));
-                SIMD.Multiply(ref retval, 1f / norm);
+                var norm = (float)(Data.Similarity == SimilarityType.Dot ? Math.Pow(ws.Count, Data.P) : Norm2(retval));
+                SIMD.Multiply(retval, 1f / norm);
             }
         }
 
@@ -835,8 +799,8 @@ namespace Catalyst.Models
 
             for (int i = 0; i < batch_sz; i++)
             {
-                ProjectLHS(state.Shared, batch_exs[i].LHSTokens, ref state.lhs[i]);
-                ProjectRHS(state.Shared, batch_exs[i].RHSTokens, ref state.rhsP[i]);
+                ProjectLHS(state.Shared, batch_exs[i].LHSTokens, state.lhs[i]);
+                ProjectRHS(state.Shared, batch_exs[i].RHSTokens, state.rhsP[i]);
             }
 
             state.batch_negLabels.Clear();
@@ -852,7 +816,7 @@ namespace Catalyst.Models
                 {
                     GetRandomRHS(state, negLabels);
                 }
-                ProjectRHS(state.Shared, negLabels, ref state.rhsN[i]);
+                ProjectRHS(state.Shared, negLabels, state.rhsN[i]);
                 state.batch_negLabels.Add(negLabels);
             }
 
@@ -864,14 +828,14 @@ namespace Catalyst.Models
 
                 int cls_cnt = 1;
                 state.prob[i].Clear();
-                state.prob[i].Add(SIMD.DotProduct(ref state.lhs[i], ref state.rhsP[i]));
+                state.prob[i].Add(SIMD.DotProduct(state.lhs[i], state.rhsP[i]));
                 float max = state.prob[i][0];
 
                 for (int j = 0; j < negSearchLimit; j++)
                 {
                     state.nRate[i][j] = 0f;
                     if (state.batch_negLabels[j] == batch_exs[i].RHSTokens) { continue; }
-                    state.prob[i].Add(SIMD.DotProduct(ref state.lhs[i], ref state.rhsN[j]));
+                    state.prob[i].Add(SIMD.DotProduct(state.lhs[i], state.rhsN[j]));
                     max = Math.Max(state.prob[i][0], state.prob[i][cls_cnt]);
                     index.Add(j);
                     cls_cnt += 1;
@@ -916,12 +880,12 @@ namespace Catalyst.Models
 
                 state.rhsP[i].AsSpan().CopyTo(state.gradW[i].AsSpan());
 
-                SIMD.Multiply(ref state.gradW[i], state.prob[i][0] - 1);
+                SIMD.Multiply(state.gradW[i], state.prob[i][0] - 1);
 
                 for (int j = 1; j < cls_cnt; j++)
                 {
                     var inj = index[j - 1];
-                    SIMD.MultiplyAndAdd(ref state.gradW[i], ref state.rhsN[inj], state.prob[i][j]); //TODO Check if equivalent to this: gradW[i].add(rhsN[inj], prob[i][j]);
+                    SIMD.MultiplyAndAdd(state.gradW[i], state.rhsN[inj], state.prob[i][j]); //TODO Check if equivalent to this: gradW[i].add(rhsN[inj], prob[i][j]);
                     state.nRate[i][inj] = state.prob[i][j] * rate0;
                 }
 
@@ -943,15 +907,15 @@ namespace Catalyst.Models
 
         private float Similarity(ref float[] lhs, ref float[] rhs)
         {
-            return Data.Similarity == SimilarityType.Dot ? SIMD.DotProduct(ref lhs, ref rhs) : SIMD.CosineSimilarity(ref lhs, ref rhs);
+            return Data.Similarity == SimilarityType.Dot ? SIMD.DotProduct(lhs, rhs) : SIMD.CosineSimilarity(lhs, rhs);
         }
 
         private ParseResults GetExample(ThreadState state, int i)
         {
-            return Convert(ref state.Corpus[i]);
+            return Convert(state.Corpus[i]);
         }
 
-        private ParseResults Convert(ref ParseResults example)
+        private ParseResults Convert(ParseResults example)
         {
             var result = new ParseResults();
             result.Weight = example.Weight;
@@ -1175,6 +1139,8 @@ namespace Catalyst.Models
             internal float[][] rhsP;
             internal float[][] rhsN;
             internal float[][] nRate;
+
+            public TrainingHistory TrainingHistory { get; internal set; }
 
             public ThreadState(ParseResults[] corpus, int thread, CancellationToken token, SharedState sharedState, Measure measure, int batch_sz, int negSearchLimit, int dim)
             {

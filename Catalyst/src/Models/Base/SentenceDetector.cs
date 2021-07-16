@@ -16,7 +16,7 @@ namespace Catalyst.Models
         public Dictionary<int, float[]> Weights { get; set; }
     }
 
-    public class SentenceDetector : StorableObject<SentenceDetector, SentenceDetectorModel>, ISentenceDetector, IProcess
+    public class SentenceDetector : StorableObjectV2<SentenceDetector, SentenceDetectorModel>, ISentenceDetector, IProcess
     {
         private const int N_Tags = 2;
         private Dictionary<int, float[]> AverageWeights { get; set; }
@@ -48,26 +48,26 @@ namespace Catalyst.Models
 
             if (document.Spans.Count() != 1)
             {
-                throw new InvalidOperationException("Document must be tokenized first");
+                return; //Document has already been tokenized and passed to the sentence detection, so ignore the second call
             }
 
-            var tokens = document.Spans.First().Tokens.ToList();
+            var tokens = document.Spans.First().Tokens.ToArray();
+
+            if (tokens.Length == 0) { return; }
 
             bool hasReplacements = false;
             //NOTE: This loop is not used for anything here, but instead to force tokens to cache the replacement
             //      As they'll not be able to retrieve it later when re-added to the document.
-            for (int i = 0; i < tokens.Count; i++)
+            for (int i = 0; i < tokens.Length; i++)
             {
                 hasReplacements |= (tokens[i].Replacement is null);
             }
 
-            //var tokens = SentenceDetectorTokenizer(document.Value).ToList();
-            var text = document.Value;
-
-            //TODO: FIX THIS NOT TO USE STRING; USE SPAN INSTEAD
+            var text = document.Value.AsSpan();
 
             const int padding = 2;
-            var paddedTokens = new List<IToken>(tokens.Count + 2 * padding);
+
+            var paddedTokens = new List<IToken>(tokens.Length + 2 * padding);
 
             paddedTokens.Add(SpecialToken.BeginToken);
             paddedTokens.Add(SpecialToken.BeginToken);
@@ -90,10 +90,9 @@ namespace Catalyst.Models
             document.Clear();
 
             //Now split the original document at the right places
-            var separators = CharacterClasses.WhitespaceCharacters;
-
+            
             //If any sentence detected within the single span (i.e. ignoring the first and last tokens
-            if (isSentenceEnd.AsSpan().Slice(padding + 1, tokens.Count - 1).IndexOf(true) >= 0)
+            if (isSentenceEnd.AsSpan().Slice(padding + 1, tokens.Length - 1).IndexOf(true) >= 0)
             {
                 int offset = 0;
                 for (int i = padding; i < N - padding; i++)
@@ -109,7 +108,7 @@ namespace Catalyst.Models
 
                         try
                         {
-                            if (!text.AsSpan().Slice(b, e - b + 1).IsNullOrWhiteSpace())
+                            if (!text.Slice(b, e - b + 1).IsNullOrWhiteSpace())
                             {
                                 var span = document.AddSpan(b, e);
                                 foreach (var t in tokens)
@@ -123,7 +122,7 @@ namespace Catalyst.Models
                         }
                         catch (Exception)
                         {
-                            Logger.LogCritical("Failed to tokenize: b={b} e={e} l={l} offset={offset} tEnd={tEnd} i={i} tCount={tCount}", b, e, text.Length, offset, tokens[i - padding].End, i, tokens.Count);
+                            Logger.LogCritical("Failed to tokenize: b={b} e={e} l={l} offset={offset} tEnd={tEnd} i={i} tCount={tCount}", b, e, text.Length, offset, tokens[i - padding].End, i, tokens.Length);
                             throw;
                         }
                         offset = e + 1;
@@ -134,10 +133,9 @@ namespace Catalyst.Models
                     int b = offset;
                     int e = document.Length - 1;
                     while (char.IsWhiteSpace(text[b]) && b < e) { b++; }
-
                     while (char.IsWhiteSpace(text[e]) && e > b) { e--; }
 
-                    if (!text.AsSpan().Slice(b, e - b + 1).IsNullOrWhiteSpace())
+                    if (!text.Slice(b, e - b + 1).IsNullOrWhiteSpace())
                     {
                         var span = document.AddSpan(b, e);
                         foreach (var t in tokens)
@@ -173,7 +171,7 @@ namespace Catalyst.Models
             return Tokenizer.Parse(input);
         }
 
-        public void Train(List<List<SentenceDetectorToken>> sentences, int trainingSteps = 20)
+        public double Train(List<List<SentenceDetectorToken>> sentences, int trainingSteps = 20)
         {
             Data = new SentenceDetectorModel();
             Data.Weights = new Dictionary<int, float[]>();
@@ -181,6 +179,8 @@ namespace Catalyst.Models
 
             var sw = new System.Diagnostics.Stopwatch();
             var rng = new Random();
+            
+            double precision = 0;
 
             for (int step = 0; step < trainingSteps; step++)
             {
@@ -228,8 +228,10 @@ namespace Catalyst.Models
 
                     totalTokens += tokens.Count;
                 }
+
+                precision = correct / total;
                 sw.Stop();
-                Console.WriteLine($"{Languages.EnumToCode(Language)} Step {step + 1}/{trainingSteps}: {Math.Round(100 * correct / total, 2)}% at a rate of {Math.Round(1000 * totalTokens / sw.ElapsedMilliseconds, 0) } tokens/second");
+                Logger.LogInformation($"{Languages.EnumToCode(Language)} Step {step + 1}/{trainingSteps}: {Math.Round(100 * correct / total, 2)}% at a rate of {Math.Round(1000 * totalTokens / sw.ElapsedMilliseconds, 0) } tokens/second");
                 sw.Restart();
 
                 UpdateAverages();
@@ -238,6 +240,7 @@ namespace Catalyst.Models
             UpdateAverages(final: true, trainingSteps: trainingSteps);
 
             FinishTraining();
+            return precision * 100;
         }
 
         private void FinishTraining()
@@ -450,6 +453,9 @@ namespace Catalyst.Models
             public string Value { get; set; }
 
             public ReadOnlySpan<char> ValueAsSpan => Value.AsSpan();
+            public string Lemma { get; set; }
+
+            public ReadOnlySpan<char> LemmaAsSpan => Lemma.AsSpan();
 
             public string Replacement { get => throw new NotImplementedException(); set => throw new NotImplementedException(); }
             public int Hash { get => throw new NotImplementedException(); set => throw new NotImplementedException(); }

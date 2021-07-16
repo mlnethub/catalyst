@@ -5,6 +5,7 @@ using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Collections.Concurrent;
 
 namespace Catalyst
 {
@@ -44,6 +45,25 @@ namespace Catalyst
                 for(int i = 0; i < candidate.Length; i++)
                 {
                     if (!CharacterClasses.ValidURLCharacters.Contains(candidate[i])) { return false; }
+                }
+                
+                if(candidate.IndexOf('@') < 0)
+                {
+                    //Special case for a common issue when tokenizing text in the form of:
+                    // see here:http://www.somevalidurl.com
+                    // where here: was being tokenized together with the actual URL
+
+                    var firstColon = candidate.IndexOf(':');
+                    if(firstColon >= 0)
+                    {
+                        var postColon = candidate.Slice(firstColon + 1);
+                        var secondColon = postColon.IndexOf(':');
+                        
+                        if(secondColon > 0  && secondColon < postColon.Length-2 && postColon[secondColon + 1] == '/' && postColon[secondColon + 2] == '/')
+                        {
+                            return false; 
+                        }
+                    }
                 }
             }
             return value;
@@ -177,12 +197,24 @@ namespace Catalyst
 
         //TODO: Check what's the best option:https://mathiasbynens.be/demo/url-regex
         private static Regex RE_IsURL = new Regex(@"^(\b((?:[a-z][\w-]+:(?:/{1,3}|[a-z0-9%])|www\d{0,3}[.]|[a-z0-9.\-]+[.][a-z]{2,4}/)(?:[^\s()<>]+|\(([^\s()<>]+|(\([^\s()<>]+\)))*\))+(?:\(([^\s()<>]+|(\([^\s()<>]+\)))*\)|[^\s`!()\[\]{};:'"".,<>?«»“”‘’])))$", RegexOptions.Compiled & RegexOptions.CultureInvariant & RegexOptions.IgnoreCase, TimeSpan.FromMilliseconds(10)); //Timeout in 10 millisecond!
+        private static readonly HashSet<char> IsURL_CannotEndWith = @"`!()[]{};:'"".,<>?«»“”‘’".ToHashSet();
+
         //private static Regex RE_IsEmail = new Regex(@"^\w+([-+.']\w+)*@\w+([-.]\w+)*\.\w+([-.]\w+)*$", RegexOptions.Compiled & RegexOptions.CultureInvariant & RegexOptions.IgnoreCase, TimeSpan.FromMilliseconds(1));
 
         private static bool IsURLRegex(ReadOnlySpan<char> candidate)
         {
+            if (candidate.Length == 0) return false;
             try
             {
+                //The Regex we use for checking URLs has a catastrofic backtracking issue if 
+                //the string being tested ends with any of these characters: `!()[]{};:'"".,<>?«»“”‘’
+                //Therefore we test it early and bypass the regex test, as we know it will also not match
+
+                if (IsURL_CannotEndWith.Contains(candidate[candidate.Length - 1]))
+                {
+                    return false;
+                }
+                    
                 return RE_IsURL.IsMatch(candidate.ToString());
             }
             catch (RegexMatchTimeoutException ex)
@@ -315,50 +347,60 @@ namespace Catalyst
 
         }
 
-
-        [ThreadStatic]
-        private static Dictionary<int, string> ShapesCache;
+        private static readonly ConcurrentDictionary<int, string> ShapesCache = new ConcurrentDictionary<int, string>();
 
         private static readonly int _H_Base   = "shape".AsSpan().IgnoreCaseHash32();
         private static readonly int _H_Digit  = "shape_digit".AsSpan().IgnoreCaseHash32();
         private static readonly int _H_Lower  = "shape_lower".AsSpan().IgnoreCaseHash32();
         private static readonly int _H_Upper  = "shape_upper".AsSpan().IgnoreCaseHash32();
         private static readonly int _H_Punct  = "shape_puct".AsSpan().IgnoreCaseHash32();
+        private static readonly int _H_At     = "shape_@".AsSpan().IgnoreCaseHash32();
+        private static readonly int _H_Dash   = "shape_dash".AsSpan().IgnoreCaseHash32();
+        private static readonly int _H_Slash  = "shape_slash".AsSpan().IgnoreCaseHash32();
         private static readonly int _H_Symbol = "shape_symbol".AsSpan().IgnoreCaseHash32();
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static string Shape(this ReadOnlySpan<char> token, bool compact)
+        public static string Shape(this ReadOnlySpan<char> token, bool compact = false)
         {
+            if (token.Length == 0) return "";
+
             int hash = _H_Base;
             int prevType = _H_Base;
             for (int i = 0; i < token.Length; i++)
             {
                 int type;
-                if (char.IsLower(token[i])) { type = _H_Lower; }
-                else if (char.IsUpper(token[i])) { type = _H_Upper; }
-                else if (char.IsNumber(token[i])) { type = _H_Digit; }
-                else if (char.IsPunctuation(token[i])) { type = _H_Punct; }
+                char c = token[i];
+
+                if (c == '@')       { type = _H_At; }
+                else if (c == '/' || c == '\\') { type = _H_Slash; }
+                else if (CharacterClasses.HyphenCharacters.Contains(c))  { type = _H_Dash; }
+                else if (char.IsLower(c))       { type = _H_Lower; }
+                else if (char.IsUpper(c))       { type = _H_Upper; }
+                else if (char.IsNumber(c))      { type = _H_Digit; }
+                else if (char.IsPunctuation(c)) { type = _H_Punct; }
                 else { type = _H_Symbol; }
 
                 if (!compact || type != prevType)
                 {
                     hash = Hashes.CombineWeak(hash, type);
                 }
+
                 prevType = type;
             }
-
-
-            if (ShapesCache is null) { ShapesCache = new Dictionary<int, string>(); }
 
             string shape;
 
             if(!ShapesCache.TryGetValue(hash, out shape))
             {
                 var sb = new StringBuilder(token.Length);
-                char prevchar = '\0', curchar = '\0';
+                char prevchar = '\0', curchar;
                 for (int i = 0; i < token.Length; i++)
                 {
-                    if (char.IsLower(token[i]))             { curchar = 'x'; }
+                    var c = token[i];
+                    if (c == '@')       { curchar = '@'; }
+                    else if (c == '/' || c == '\\') { curchar = '/'; }
+                    else if (CharacterClasses.HyphenCharacters.Contains(c))  { curchar = '-'; }
+                    else if (char.IsLower(token[i]))        { curchar = 'x'; }
                     else if (char.IsUpper(token[i]))        { curchar = 'X'; }
                     else if (char.IsNumber(token[i]))       { curchar = '9'; }
                     else if (char.IsPunctuation(token[i]))  { curchar = '.'; }
@@ -368,6 +410,7 @@ namespace Catalyst
                     {
                         sb.Append(curchar);
                     }
+
                     prevchar = curchar;
                 }
                 shape = sb.ToString();
@@ -375,6 +418,5 @@ namespace Catalyst
             }
             return shape;
         }
-
     }
 }

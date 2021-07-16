@@ -1,8 +1,13 @@
+
+[![Nuget](https://img.shields.io/nuget/v/Catalyst.svg?maxAge=0&colorB=brightgreen)](https://www.nuget.org/packages/Catalyst/) [![Build Status](https://dev.azure.com/curiosity-ai/mosaik/_apis/build/status/catalyst?branchName=master)](https://dev.azure.com/curiosity-ai/mosaik/_build/latest?definitionId=10&branchName=master)
+
 <img src="https://raw.githubusercontent.com/curiosity-ai/catalyst/master/Catalyst/catalyst.png?token=ACDCOAYAIML2KGJTHTJP27C5KGCEC"/>
 
-<a href="https://curiosity.ai"><img src="https://curiosity.ai/assets/images/logos/curiosity.png" width="100" height="100" align="right" /></a>
+<a href="https://curiosity.ai"><img src="https://curiosity.ai/media/cat.color.square.svg" width="100" height="100" align="right" /></a>
 
 _**catalyst**_ is a C# Natural Language Processing library built for speed. Inspired by [spaCy's design](https://spacy.io/), it brings pre-trained models, out-of-the box support for training word and document embeddings, and flexible entity recognition models.
+
+[![Gitter](https://badges.gitter.im/curiosityai/catalyst.svg)](https://gitter.im/curiosityai/catalyst?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
 
 ## ⚡ Features
 - Fast, modern pure-C# NLP library, supporting [.NET standard 2.0](https://docs.microsoft.com/en-us/dotnet/standard/net-standard)
@@ -15,11 +20,50 @@ _**catalyst**_ is a C# Natural Language Processing library built for speed. Insp
 - Part-of-speech tagging
 - Language detection using [FastText](https://github.com/curiosity-ai/catalyst/blob/master/Catalyst/src/Models/Special/FastTextLanguageDetector.cs) or [cld3](https://github.com/curiosity-ai/catalyst/blob/master/Catalyst/src/Models/Special/LanguageDetector.cs)
 - Efficient binary serialization based on [MessagePack](https://github.com/neuecc/MessagePack-CSharp/)
+- Pre-built models for [language packages](https://www.nuget.org/packages?q=catalyst.models) ✨
+- Lemmatization ✨ (using lookup tables ported from [spaCy](https://github.com/explosion/spacy-lookups-data))
+
+
+## New: Language Packages ✨
+We're migrating our model repository to use NuGet packages for all language-specific data and models. 
+
+You can find all  new language packages [here](https://www.nuget.org/packages?q=catalyst.models). 
+
+The new models are trained on the latest release of [Universal Dependencies v2.7](https://universaldependencies.org/).
+
+This is technically not a breaking change *yet*, but our online repository will be deprecated in the near future - so you should migrate to the new NuGet packages.
+
+When using the new model packages, you can usually remove this line from your code: `Storage.Current = new OnlineRepositoryStorage(new DiskStorage("catalyst-models"));`, or replace it with `Storage.Current = new DiskStorage("catalyst-models")` if you are storing your own models locally.
+
+We've also added the option to store and load models using streams:
+`````csharp
+// Creates and stores the model
+var isApattern = new PatternSpotter(Language.English, 0, tag: "is-a-pattern", captureTag: "IsA");
+isApattern.NewPattern(
+    "Is+Noun",
+    mp => mp.Add(
+        new PatternUnit(P.Single().WithToken("is").WithPOS(PartOfSpeech.VERB)),
+        new PatternUnit(P.Multiple().WithPOS(PartOfSpeech.NOUN, PartOfSpeech.PROPN, PartOfSpeech.AUX, PartOfSpeech.DET, PartOfSpeech.ADJ))
+));
+using(var f = File.OpenWrite("my-pattern-spotter.bin"))
+{
+    await isApattern.StoreAsync(f);
+}
+
+// Load the model back from disk
+var isApattern2 = new PatternSpotter(Language.English, 0, tag: "is-a-pattern", captureTag: "IsA");
+
+using(var f = File.OpenRead("my-pattern-spotter.bin"))
+{
+    await isApattern2.LoadAsync(f);
+}
+`````
 
 
 ## ✨ Getting Started
 
-Using _**catalyst**_ is as simple as installing its [NuGet Package](https://www.nuget.org/packages/Catalyst), and setting the storage to use our online repository. This way, models will be lazy loaded either from disk or downloaded from our online repository.
+Using _**catalyst**_ is as simple as installing its [NuGet Package](https://www.nuget.org/packages/Catalyst), and setting the storage to use our online repository. This way, models will be lazy loaded either from disk or downloaded from our online repository. **Check out also some of the [sample projects](https://github.com/curiosity-ai/catalyst/tree/master/samples)** for more examples on how to use _**catalyst**_.
+
 
 ```csharp
 Storage.Current = new OnlineRepositoryStorage(new DiskStorage("catalyst-models"));
@@ -69,14 +113,13 @@ For fast embedding search, we have also released a C# version of the ["Hierarchi
 
 
 
-## 📖 Documentation (coming soon)
+## 📖 Links
 
-| Documentation     |                                                       |
-| ----------------- | ----------------------------------------------------- |
-| [Getting Started] | How to use _**catalyst**_ and its features.           |
-| [API Reference]   | The detailed reference for _**catalyst**_'s API.      |
-| [Contribute]      | How to contribute to _**catalyst**_ codebase.         |
+| Documentation     |                                                           |
+| ----------------- | --------------------------------------------------------- |
+| [Contribute]      | How to contribute to _**catalyst**_ codebase.             |
+| [Samples]         | Sample projects demonstrating _**catalyst**_ capabilities |
+| [![Gitter](https://badges.gitter.im/curiosityai/catalyst.svg)](https://gitter.im/curiosityai/catalyst?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)  | Join our gitter channel                                    |
 
-[Getting Started]: https://catalyst.curiosity.ai/getting-started
-[api reference]: https://catalyst.curiosity.ai/api
-[contribute]: https://github.com/curiosity-ai/catalyst/blob/master/CONTRIBUTING.md
+[Contribute]: https://github.com/curiosity-ai/catalyst/blob/master/CONTRIBUTING.md
+[Samples]: https://github.com/curiosity-ai/catalyst/tree/master/samples

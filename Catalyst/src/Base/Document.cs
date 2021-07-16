@@ -32,6 +32,7 @@ namespace Catalyst
         [Key(8)] public Dictionary<long, Dictionary<string, string>> TokenMetadata { get; set; }
 
         [IgnoreMember] public int Length { get { return Value.Length; } }
+        [IgnoreMember] public bool IsParsed { get { return SpansCount > 0 && TokensCount  > 0; } }
 
         [JsonIgnore] [IgnoreMember] public int SpansCount { get { return SpanBounds.Count; } }
 
@@ -92,6 +93,11 @@ namespace Catalyst
             Labels = labels;
             EntityData = entityData;
             TokenMetadata = (tokenMetadata is null || tokenMetadata.Count == 0) ? null : tokenMetadata;
+        }
+
+        public Document Clone()
+        {
+            return new Document(this);
         }
 
         public void Clear()
@@ -181,46 +187,41 @@ namespace Catalyst
             return new Span(this, SpanBounds.Count - 1);
         }
 
-        [JsonIgnore]
-        [IgnoreMember]
-        public string TokenizedValue
+        public string TokenizedValue(bool mergeEntities = false)
         {
-            get
+            var sb = new StringBuilder(Value.Length + TokensCount * 10 + 100);
+            for (int i = 0; i < SpanBounds.Count(); i++)
             {
-                var sb = new StringBuilder(Value.Length + TokensCount * 10 + 100);
-                for (int i = 0; i < SpanBounds.Count(); i++)
+                foreach (var token in this[i])
                 {
-                    foreach (var token in this[i])
+                    if (mergeEntities && token.EntityTypes.Any(et => et.Tag == EntityTag.Begin || et.Tag == EntityTag.Inside))
                     {
-                        if (token.EntityTypes.Any(et => et.Tag == EntityTag.Begin || et.Tag == EntityTag.Inside))
+                        bool isHyphen = token.ValueAsSpan.IsHyphen();
+                        bool isNormalToken = !isHyphen && !token.ValueAsSpan.IsSentencePunctuation();
+                        if (!isNormalToken)
                         {
-                            bool isHyphen = token.ValueAsSpan.IsHyphen();
-                            bool isNormalToken = !isHyphen && !token.ValueAsSpan.IsSentencePunctuation();
-                            if (!isNormalToken)
+                            if (sb[sb.Length - 1] == '_')
                             {
-                                if (sb[sb.Length - 1] == '_')
-                                {
-                                    sb.Length--; //if we have a punctuation or hyphen, and the previous token added a '_', remove it here
-                                }
+                                sb.Length--; //if we have a punctuation or hyphen, and the previous token added a '_', remove it here
                             }
-                            if (!isHyphen)
-                            {
-                                sb.Append(token.Value);
-                            }
-                            else
-                            {
-                                sb.Append("_");
-                            }
-                            if (isNormalToken) { sb.Append("_"); } //don't add _ when the token is already a hyphen
+                        }
+                        if (!isHyphen)
+                        {
+                            sb.Append(token.Value);
                         }
                         else
                         {
-                            sb.Append(token.Value).Append(" ");
+                            sb.Append("_");
                         }
+                        if (isNormalToken) { sb.Append("_"); } //don't add _ when the token is already a hyphen
+                    }
+                    else
+                    {
+                        sb.Append(token.Value).Append(" ");
                     }
                 }
-                return Regex.Replace(sb.ToString(), @"\s+", " ").TrimEnd(); //Remove the last space added during the loop
             }
+            return Regex.Replace(sb.ToString(), @"\s+", " ").TrimEnd(); //Remove the last space added during the loop
         }
 
         [JsonIgnore]
@@ -472,7 +473,7 @@ namespace Catalyst
         {
             var sb = StringExtensions.StringBuilderPool.Rent();
             using(var tw = new StringWriter(sb))
-            using (var jw = new JsonTextWriter(tw))
+            using (var jw = new JsonTextWriter(tw).AsIJsonWriter())
             {
                 WriteAsJson(jw);
             }
@@ -486,17 +487,17 @@ namespace Catalyst
             return FromJObject(JObject.Parse(json));
         }
 
-        public void WriteAsJson(JsonTextWriter jw)
+        public void WriteAsJson(IJsonWriter jw)
         {
             jw.WriteStartObject();
 
-            jw.WritePropertyName(nameof(Language)); jw.WriteValue(Languages.EnumToCode(Language));
-            jw.WritePropertyName(nameof(Length)); jw.WriteValue(Length);
-            jw.WritePropertyName(nameof(Value)); jw.WriteValue(Value);
+            jw.WritePropertyName(nameof(Language)); jw.WriteStringValue(Languages.EnumToCode(Language));
+            jw.WritePropertyName(nameof(Length)); jw.WriteNumberValue(Length);
+            jw.WritePropertyName(nameof(Value)); jw.WriteStringValue(Value);
 
             if (UID.IsNotNull())
             {
-                jw.WritePropertyName(nameof(UID)); jw.WriteValue(UID.ToString());
+                jw.WritePropertyName(nameof(UID)); jw.WriteStringValue(UID);
             }
 
             if (Metadata is object && Metadata.Any())
@@ -505,7 +506,7 @@ namespace Catalyst
                 jw.WriteStartObject();
                 foreach (var kv in Metadata)
                 {
-                    jw.WritePropertyName(kv.Key); jw.WriteValue(kv.Value);
+                    jw.WritePropertyName(kv.Key); jw.WriteStringValue(kv.Value);
                 }
                 jw.WriteEndObject();
             }
@@ -516,7 +517,7 @@ namespace Catalyst
                 jw.WriteStartArray();
                 foreach (var l in Labels)
                 {
-                    jw.WriteValue(l);
+                    jw.WriteStringValue(l);
                 }
                 jw.WriteEndArray();
             }
@@ -535,28 +536,28 @@ namespace Catalyst
                     jw.WriteStartObject();
                     jw.WritePropertyName(nameof(TokenData.Bounds));
                     jw.WriteStartArray();
-                    jw.WriteValue(tk.LowerBound);
-                    jw.WriteValue(tk.UpperBound);
+                    jw.WriteNumberValue(tk.LowerBound);
+                    jw.WriteNumberValue(tk.UpperBound);
                     jw.WriteEndArray();
 
                     if (tk.Tag != PartOfSpeech.NONE)
                     {
-                        jw.WritePropertyName(nameof(TokenData.Tag)); jw.WriteValue(tk.Tag.ToString());
+                        jw.WritePropertyName(nameof(TokenData.Tag)); jw.WriteStringValue(tk.Tag.ToString());
                     }
 
                     if (tk.Head >= 0)
                     {
-                        jw.WritePropertyName(nameof(TokenData.Head)); jw.WriteValue(tk.Head);
+                        jw.WritePropertyName(nameof(TokenData.Head)); jw.WriteNumberValue(tk.Head);
                     }
 
                     if (tk.Frequency != 0)
                     {
-                        jw.WritePropertyName(nameof(TokenData.Frequency)); jw.WriteValue(tk.Frequency);
+                        jw.WritePropertyName(nameof(TokenData.Frequency)); jw.WriteNumberValue(tk.Frequency);
                     }
 
                     if (!string.IsNullOrEmpty(tk.Replacement))
                     {
-                        jw.WritePropertyName(nameof(TokenData.Replacement)); jw.WriteValue(tk.Replacement);
+                        jw.WritePropertyName(nameof(TokenData.Replacement)); jw.WriteStringValue(tk.Replacement);
                     }
 
                     if (TokenMetadata is object)
@@ -569,7 +570,7 @@ namespace Catalyst
                                 jw.WriteStartObject();
                                 foreach (var kv in tokenMetadata)
                                 {
-                                    jw.WritePropertyName(kv.Key); jw.WriteValue(kv.Value);
+                                    jw.WritePropertyName(kv.Key); jw.WriteStringValue(kv.Value);
                                 }
                                 jw.WriteEndObject();
                             }
@@ -587,12 +588,12 @@ namespace Catalyst
                                 for (int k = 0; k < entities.Count; k++)
                                 {
                                     jw.WriteStartObject();
-                                    jw.WritePropertyName(nameof(EntityType.Type)); jw.WriteValue(entities[k].Type);
-                                    jw.WritePropertyName(nameof(EntityType.Tag)); jw.WriteValue(entities[k].Tag.ToString());
+                                    jw.WritePropertyName(nameof(EntityType.Type)); jw.WriteStringValue(entities[k].Type);
+                                    jw.WritePropertyName(nameof(EntityType.Tag)); jw.WriteStringValue(entities[k].Tag.ToString());
 
                                     if (entities[k].TargetUID.IsNotNull())
                                     {
-                                        jw.WritePropertyName(nameof(EntityType.TargetUID)); jw.WriteValue(entities[k].TargetUID.ToString());
+                                        jw.WritePropertyName(nameof(EntityType.TargetUID)); jw.WriteStringValue(entities[k].TargetUID);
                                     }
 
                                     if (!(entities[k].Metadata is null) && entities[k].Metadata.Any())
@@ -601,7 +602,7 @@ namespace Catalyst
                                         jw.WriteStartObject();
                                         foreach (var kv in entities[k].Metadata)
                                         {
-                                            jw.WritePropertyName(kv.Key); jw.WriteValue(kv.Value);
+                                            jw.WritePropertyName(kv.Key); jw.WriteStringValue(kv.Value);
                                         }
                                         jw.WriteEndObject();
                                     }

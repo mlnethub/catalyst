@@ -4,12 +4,14 @@ using System.Collections.Generic;
 using System.IO;
 using System.Net.Http;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
 using Mosaik.Core;
 
 namespace Catalyst
 {
     public class OnlineRepositoryStorage : IStorage
     {
+        private static ILogger Logger = ApplicationLogging.CreateLogger<OnlineRepositoryStorage>();
         internal IStorage Disk { get; }
 
         internal static HttpClient Client;
@@ -38,8 +40,6 @@ namespace Catalyst
 
         public void DeleteEmptyDirectories(string path) => Disk.DeleteEmptyDirectories(path);
 
-        public (FileStream stream, string fileName) GetSharedTempStream(string path, long expectedLength = -1) => Disk.GetSharedTempStream(path, expectedLength);
-
         public FileStream GetTempStream() => Disk.GetTempStream();
 
         public IEnumerable<string> ListFiles(string path, string pattern, SearchOption searchOption) => Disk.ListFiles(path, pattern, searchOption);
@@ -64,6 +64,7 @@ namespace Catalyst
                 var (objInfo, compressed) = MapPathToObjectInfo[path];
                 if(await ExistsOnlineAsync(objInfo, compressed))
                 {
+                    Logger.LogInformation($"Downloading model {objInfo.ModelType} {objInfo.Language} v{objInfo.Version} from online repository, please wait...");
                     using (var f = await DownloadFileAsync(objInfo, compressed))
                     using (var target = await Disk.OpenLockedStreamAsync(path, FileAccess.Write))
                     {
@@ -71,12 +72,17 @@ namespace Catalyst
                         await target.FlushAsync();
                         target.Close();
                     }
+                    Logger.LogInformation($"Downloaded file {objInfo.ModelType} {objInfo.Language} v{objInfo.Version} from online repository!");
                     return await Disk.OpenLockedStreamAsync(path, access);
                 }
                 else
                 {
                     throw new FileNotFoundException(path);
                 }
+            }
+            else if(access == FileAccess.Write)
+            {
+                return await Disk.OpenLockedStreamAsync(path, access);
             }
             else
             {
@@ -93,7 +99,7 @@ namespace Catalyst
             }
             else if (resp.StatusCode == System.Net.HttpStatusCode.NoContent)
             {
-                throw new FileNotFoundException();
+                throw new FileNotFoundException(RepositoryAddress + $"models?modelType={objInfo.ModelType}&language={Languages.EnumToCode(objInfo.Language)}&version={objInfo.Version}&tag={objInfo.Tag ?? ""}&compress={compressed}");
             }
             else
             {

@@ -14,7 +14,7 @@ namespace Catalyst.Models
         public List<MatchingPattern> Patterns { get; set; } = new List<MatchingPattern>();
     }
 
-    public class PatternSpotter : StorableObject<PatternSpotter, PatternSpotterModel>, IEntityRecognizer, IProcess
+    public class PatternSpotter : StorableObjectV2<PatternSpotter, PatternSpotterModel>, IEntityRecognizer, IProcess
     {
         private PatternSpotter(Language language, int version, string tag) : base(language, version, tag, compress: false)
         {
@@ -74,9 +74,11 @@ namespace Catalyst.Models
             int N = tokens.Length;
             bool foundAny = false;
 
+            var patterns = Data.Patterns; //copy local reference for the loop
+
             for (int i = 0; i < N; i++)
             {
-                foreach (var p in Data.Patterns)
+                foreach (var p in patterns)
                 {
                     if (p.IsMatch(tokens.Slice(i), out var consumedTokens))
                     {
@@ -148,7 +150,8 @@ namespace Catalyst.Models
 
         public void From(MatchingPattern mp)
         {
-            Patterns.AddRange(mp.Patterns);
+            //Creates new instances of all PatternUnits in the source MatchingPattern
+            Patterns.AddRange(mp.Patterns.Select(pu => pu.Select(p => p.Clone()).ToArray()));
         }
 
         public bool IsMatch(Span<Token> tokens, out int consumedTokens)
@@ -159,15 +162,27 @@ namespace Catalyst.Models
                 var currentToken = 0;
                 for (int j = 0; j < Patterns[i].Length; j++)
                 {
-                    PatternUnit currentPattern = Patterns[i][j];
+                    var currentPattern = Patterns[i][j];
                     int ct = currentToken;
+                    
+                    int maxMatches = currentPattern.MaxMatches;
+                    
+                    if (maxMatches == 0) maxMatches = 10;
+
                     bool hasMatched = false;
 
-                    while (ct < tokens.Length && currentPattern.IsMatch(ref tokens[ct]))
+                    while (ct < tokens.Length && currentPattern.IsMatch(ref tokens[ct]) && maxMatches > 0)
                     {
                         ct++;
                         hasMatched = true;
-                        if (currentPattern.Mode == PatternMatchingMode.Single) { break; }
+                        if (currentPattern.Mode == PatternMatchingMode.Single) 
+                        {
+                            break;
+                        }
+                        else
+                        {
+                            maxMatches--; //Limits the number of multiple matches
+                        }
                     }
 
                     if (hasMatched)
@@ -183,6 +198,7 @@ namespace Catalyst.Models
                         }
                     }
                 }
+
                 if (largestMatch < currentToken) { largestMatch = currentToken; }
             }
 
@@ -214,71 +230,95 @@ namespace Catalyst.Models
     [MessagePackObject]
     public class PatternUnit
     {
-        [Key(0)] public PatternMatchingMode Mode;
-        [Key(1)] public bool Optional;
-        [Key(2)] public bool CaseSensitive;
-        [Key(3)] public PatternUnitType Type;
-        [Key(4)] public PartOfSpeech[] POS;
-        [Key(5)] public string Suffix;
-        [Key(6)] public string Prefix;
-        [Key(7)] public string Shape;
-        [Key(8)] public string Token;
-        [Key(9)] public HashSet<string> Set;
-        [Key(10)] public string EntityType;
-        [Key(11)] public HashSet<ulong> SetHashes;
-        [Key(12)] public ulong TokenHash;
-        [Key(13)] public PatternUnit LeftSide;
-        [Key(14)] public PatternUnit RightSide;
-        [Key(15)] public HashSet<char> ValidChars;
-        [Key(16)] public int MinLength;
-        [Key(17)] public int MaxLength;
+        [Key(0)] public PatternMatchingMode Mode { get; set; }
+        [Key(1)] public bool Optional { get; set; }
+        [Key(2)] public bool CaseSensitive { get => caseSensitive; set { caseSensitive = value; Set = set; } } //Reset Set so it recomputes the hashes based on the new case sensitivity
+        [Key(3)] public PatternUnitType Type { get; set; }
+        [Key(4)] public PartOfSpeech[] POS { get; set; }
+        [Key(5)] public string Suffix { get => suffix; set { suffix = value; _splitSuffix = suffix?.Split(splitCharWithWhitespaces, StringSplitOptions.RemoveEmptyEntries)?.Distinct()?.ToArray(); } }
+        [Key(6)] public string Prefix { get => prefix; set { prefix = value; _splitPrefix = prefix?.Split(splitCharWithWhitespaces, StringSplitOptions.RemoveEmptyEntries)?.Distinct()?.ToArray(); } }
+        [Key(7)] public string Shape { get => shape; set { shape = value; _splitShape = !string.IsNullOrWhiteSpace(shape) ? new HashSet<string>(shape.Split(splitCharWithWhitespaces, StringSplitOptions.RemoveEmptyEntries).Select(s => s.AsSpan().Shape(compact: false))) : null; } }
+        [Key(8)] public string Token { get; set; }
+        [Key(9)] public string[] Set { get => set; set { set = value?.Distinct()?.ToArray(); _setHashes = set is object ? new HashSet<ulong>(set.Select(tk => CaseSensitive ? PatternUnitPrototype.Hash64(tk.AsSpan()) : PatternUnitPrototype.IgnoreCaseHash64(tk.AsSpan()))) : null; } }
+        [Key(10)] public string EntityType { get => entityType; set { entityType = value; _splitEntityType = entityType is object ? new HashSet<string>(entityType.Split(splitChar, StringSplitOptions.RemoveEmptyEntries)) : null; } }
+
+        //[Key(11)] removed
+
+        //[Key(12)] removed
+
+        [Key(13)] public PatternUnit LeftSide { get; set; }
+        [Key(14)] public PatternUnit RightSide { get; set; }
+        [Key(15)] public HashSet<char> ValidChars { get; set; }
+        [Key(16)] public int MinLength { get; set; }
+        [Key(17)] public int MaxLength { get; set; }
+        [Key(18)] public int MaxMatches { get; set; }
+
+        internal readonly static char[] splitChar = new[] { ',' };
+        internal readonly static char[] splitCharWithWhitespaces = splitChar.Concat(CharacterClasses.WhitespaceCharacters).ToArray();
+
+        private string[] _splitSuffix;
+        private string[] _splitPrefix;
+        private HashSet<string> _splitEntityType;
+        private HashSet<string> _splitShape;
+        private HashSet<ulong> _setHashes;
+
+        private string suffix;
+        private string prefix;
+        private string shape;
+        private string entityType;
+        private string[] set;
+        private bool caseSensitive;
+        private PatternUnit p;
 
         public PatternUnit(IPatternUnit prototype)
         {
             var p = (PatternUnitPrototype)prototype;
-            Mode = p.Mode;
-            Optional = p.Optional;
+            Mode          = p.Mode;
+            Optional      = p.Optional;
             CaseSensitive = p.CaseSensitive;
-            Type = p.Type;
-            POS = p.POS;
-            Suffix = p.Suffix;
-            Prefix = p.Prefix;
-            Shape = p.Shape;
-            Token = p.Token;
-            Set = p.Set;
-            EntityType = p.EntityType;
-            SetHashes = p.SetHashes ?? (p.Set is null ? null : new HashSet<ulong>(p.Set.Select(token => p.CaseSensitive ? PatternUnitPrototype.Hash64(token.AsSpan()) : PatternUnitPrototype.IgnoreCaseHash64(token.AsSpan()))));
-            TokenHash = p.TokenHash;
-            LeftSide = p.LeftSide is object ? new PatternUnit(p.LeftSide) : null;
-            RightSide = p.RightSide is object ? new PatternUnit(p.RightSide) : null;
-            ValidChars = p.ValidChars;
-            MinLength = p.MinLength;
-            MaxLength = p.MaxLength;
+            Type          = p.Type;
+            POS           = p.POS;
+            Suffix        = p.Suffix;
+            Prefix        = p.Prefix;
+            Shape         = p.Shape;
+            Token         = p.Token;
+            Set           = p.Set?.ToArray() ?? Array.Empty<string>();
+            EntityType    = p.EntityType;
+            LeftSide      = p.LeftSide is object ? new PatternUnit(p.LeftSide) : null;
+            RightSide     = p.RightSide is object ? new PatternUnit(p.RightSide) : null;
+            ValidChars    = p.ValidChars;
+            MinLength     = p.MinLength;
+            MaxLength     = p.MaxLength;
+            MaxMatches    = p.MaxMatches;
         }
 
+        //Constructor for Json/MsgPack serialization
         public PatternUnit()
         {
-            //Constructor for Json serialization
         }
 
-        [SerializationConstructor]
-        public PatternUnit(PatternMatchingMode mode, bool optional, bool caseSensitive, PatternUnitType type, PartOfSpeech[] pos, string suffix, string prefix, string shape, string token, HashSet<string> set, string entityType, HashSet<ulong> setHashes, ulong tokenHash, PatternUnit leftSide, PatternUnit rightSide)
+        public PatternUnit Clone()
         {
-            Mode = mode;
-            Optional = optional;
-            CaseSensitive = caseSensitive;
-            Type = type;
-            POS = pos;
-            Suffix = suffix;
-            Prefix = prefix;
-            Shape = shape?.AsSpan().Shape(false);
-            Token = token;
-            Set = set;
-            EntityType = entityType;
-            SetHashes = setHashes ?? (set is null ? null : new HashSet<ulong>(set.Select(tk => CaseSensitive ? PatternUnitPrototype.Hash64(tk.AsSpan()) : PatternUnitPrototype.IgnoreCaseHash64(tk.AsSpan()))));
-            TokenHash = tokenHash;
-            LeftSide = leftSide;
-            RightSide = rightSide;
+            return new PatternUnit()
+            {
+                Mode          = Mode,
+                Optional      = Optional,
+                CaseSensitive = CaseSensitive,
+                Type          = Type,
+                POS           = POS,
+                Suffix        = Suffix,
+                Prefix        = Prefix,
+                Shape         = Shape,
+                Token         = Token,
+                Set           = Set,
+                EntityType    = EntityType,
+                LeftSide      = LeftSide,
+                RightSide     = RightSide,
+                ValidChars    = ValidChars,
+                MinLength     = MinLength,
+                MaxLength     = MaxLength,
+                MaxMatches    = MaxMatches
+            };
         }
 
         #region Match
@@ -286,6 +326,7 @@ namespace Catalyst.Models
         public bool IsMatch(ref Token token)
         {
             bool isMatch = true;
+
             if (token.Length < 1) { return false; } //Empty tokens never match
 
             if (Mode == PatternMatchingMode.And)
@@ -302,7 +343,7 @@ namespace Catalyst.Models
                 if (isMatch && (Type & PatternUnitType.Token) == PatternUnitType.Token) { isMatch &= MatchToken(ref token); }
                 if (isMatch && (Type & PatternUnitType.Shape) == PatternUnitType.Shape) { isMatch &= MatchShape(ref token); }
                 if (isMatch && (Type & PatternUnitType.WithChars) == PatternUnitType.WithChars) { isMatch &= MatchWithChars(ref token); }
-                //if (isMatch && (Type & PatternUnitType.Script) == PatternUnitType.Script)                                 { isMatch &= MatchScript          (ref token); }
+                //if (isMatch && (Type & PatternUnitType.Script) == PatternUnitType.Script)                                 { isMatch &= MatchScript(ref token); }
                 if (isMatch && (Type & PatternUnitType.POS) == PatternUnitType.POS) { isMatch &= MatchPOS(ref token); }
                 if (isMatch && (Type & PatternUnitType.MultiplePOS) == PatternUnitType.MultiplePOS) { isMatch &= MatchMultiplePOS(ref token); }
                 if (isMatch && (Type & PatternUnitType.Suffix) == PatternUnitType.Suffix) { isMatch &= MatchSuffix(ref token); }
@@ -369,7 +410,7 @@ namespace Catalyst.Models
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private bool MatchShape(ref Token token)
         {
-            return token.ValueAsSpan.Shape(false) == Shape;
+            return _splitShape is object && _splitShape.Contains(token.ValueAsSpan.Shape(compact: false));
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -397,34 +438,47 @@ namespace Catalyst.Models
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private bool MatchSuffix(ref Token token)
         {
-            return token.ValueAsSpan.EndsWith(Suffix.AsSpan(), CaseSensitive ? StringComparison.InvariantCulture : StringComparison.InvariantCultureIgnoreCase);
+            if (_splitSuffix is null) return false;
+
+            foreach (var suffix in _splitSuffix)
+            {
+                if (token.ValueAsSpan.EndsWith(suffix.AsSpan(), CaseSensitive ? StringComparison.InvariantCulture : StringComparison.InvariantCultureIgnoreCase))
+                {
+                    return true;
+                }
+            }
+            return false;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private bool MatchPrefix(ref Token token)
         {
-            return token.ValueAsSpan.StartsWith(Prefix.AsSpan(), CaseSensitive ? StringComparison.InvariantCulture : StringComparison.InvariantCultureIgnoreCase);
+            if (_splitPrefix is null) return false;
+
+            foreach (var prefix in _splitPrefix)
+            {
+                if (token.ValueAsSpan.StartsWith(prefix.AsSpan(), CaseSensitive ? StringComparison.InvariantCulture : StringComparison.InvariantCultureIgnoreCase))
+                {
+                    return true;
+                }
+            }
+            return false;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private bool MatchSet(ref Token token)
         {
-            if (SetHashes is null)
-            {
-                //No need to lock here, as we would just replace one with another equal set if there is a colision
-                SetHashes = new HashSet<ulong>(Set.Select(tk => CaseSensitive ? PatternUnitPrototype.Hash64(tk.AsSpan()) : PatternUnitPrototype.IgnoreCaseHash64(tk.AsSpan())));
-            }
-            return SetHashes.Contains(GetTokenHash(ref token));
+            return _setHashes is object && _setHashes.Contains(GetTokenHash(ref token));
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private bool MatchEntity(ref Token token)
         {
-            if (token.EntityTypes is null) { return false; }
+            if (token.EntityTypes is null || _splitEntityType is null) { return false; }
 
             foreach (var et in token.EntityTypes)
             {
-                if (et.Type == EntityType) { return true; }
+                if (_splitEntityType.Contains(et.Type)) { return true; }
             }
             return false;
         }
@@ -504,13 +558,64 @@ namespace Catalyst.Models
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private bool MatchLikeURL(ref Token token)
         {
-            return token.ValueAsSpan.IsLikeURLorEmail(); //TODO: Split these two in URL and Email
+            var span = token.ValueAsSpan;
+
+            bool isLike = span.IsLikeURLorEmail();
+            if (isLike)
+            {
+                if (span.IndexOf('@') > 0)
+                {
+                    if (span.IndexOf(':') > 0)
+                    {
+                        return true; //probably url with password
+                    }
+                    else
+                    {
+                        return false; //probably email
+                    }
+                }
+
+                int countSlashDot = 0;
+                int hasWWW = span.IndexOf(new[] { 'w', 'w', 'w' }) > 0 ? 5 : 0;
+                int hasHTTP = span.IndexOf(new[] { 'h', 't', 't', 'p' }) > 0 ? 5 : 0;
+                int hasFTP = span.IndexOf(new[] { 'f', 't', 'p' }) > 0 ? 5 : 0;
+
+                for (int i = 0; i < span.Length; i++)
+                {
+                    if (span[i] == '.') countSlashDot++;
+                    if (span[i] == ':') countSlashDot++;
+                    if (span[i] == '/') countSlashDot++;
+                }
+
+                return countSlashDot + hasWWW + hasHTTP + hasFTP > 5;
+            }
+            else
+            {
+                return false;
+            }
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private bool MatchLikeEmail(ref Token token)
         {
-            return token.ValueAsSpan.IsLikeURLorEmail();  //TODO: Split these two in URL and Email
+            bool isLike = token.ValueAsSpan.IsLikeURLorEmail();
+            if (isLike)
+            {
+
+                //TODO: refine these rules
+                int countAt = 0;
+                int countDot = 0;
+                for (int i = 0; i < token.ValueAsSpan.Length; i++)
+                {
+                    if (token.ValueAsSpan[i] == '@') countAt++;
+                    if (token.ValueAsSpan[i] == '.') countDot++;
+                }
+                return countAt == 1 && countDot > 1;
+            }
+            else
+            {
+                return false;
+            }
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]

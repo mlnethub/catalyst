@@ -9,6 +9,9 @@ using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
+using System.IO.Compression;
+using System.Reflection;
+using MessagePack;
 
 namespace Catalyst
 {
@@ -20,6 +23,7 @@ namespace Catalyst
 
     public class Pipeline : StorableObject<Pipeline, PipelineData>, ICanUpdateModel
     {
+        internal static readonly MessagePackSerializerOptions LZ4Standard = MessagePackSerializerOptions.Standard.WithCompression(MessagePackCompression.Lz4Block);
         private List<IProcess> Processes { get; set; } = new List<IProcess>();
         private Dictionary<Language, Neuralyzer> Neuralyzers { get; set; } = new Dictionary<Language, Neuralyzer>();
 
@@ -36,10 +40,11 @@ namespace Catalyst
 
         public new static async Task<Pipeline> FromStoreAsync(Language language, int version, string tag)
         {
-            var a = new Pipeline(language, version, tag);
-            await a.LoadDataAsync();
+            var pipeline = new Pipeline(language, version, tag);
+            await pipeline.LoadDataAsync();
             var set = new HashSet<string>();
-            foreach (var md in a.Data.Processes.ToArray()) //Copy here as we'll modify the list bellow if model not found
+
+            foreach (var md in pipeline.Data.Processes.ToArray()) //Copy here as we'll modify the list bellow if model not found
             {
                 if (await md.ExistsAsync())
                 {
@@ -48,27 +53,148 @@ namespace Catalyst
                         if (set.Add(md.ToStringWithoutVersion()))
                         {
                             var process = (IProcess)await md.FromStoreAsync();
-                            a.Add(process);
+                            pipeline.Add(process);
                         }
                     }
                     catch (FileNotFoundException)
                     {
                         Logger.LogError($"Model not found on disk, ignoring: {md.ToString()}");
-                        a.Data.Processes.Remove(md);
+                        pipeline.Data.Processes.Remove(md);
                     }
                 }
                 else
                 {
-                    a.Data.Processes.Remove(md);
+                    pipeline.Data.Processes.Remove(md);
                 }
             }
 
-            if (!a.Processes.Any(p => p is ITokenizer))
+            if (!pipeline.Processes.Any(p => p is ITokenizer))
             {
-                a.AddToBegin(new FastTokenizer(language)); //Fix bug that removed all tokenizers from the pipelines due to missing ExistsAsync
+                pipeline.AddToBegin(new FastTokenizer(language)); //Fix bug that removed all tokenizers from the pipelines due to missing ExistsAsync
             }
 
-            return a;
+            return pipeline;
+        }
+
+        public void PackTo(Stream outputStream)
+        {
+            UpdateProcessData();
+            using (var zip = new ZipArchive(outputStream, ZipArchiveMode.Create,leaveOpen: true))
+            {
+                var infoEntry = zip.CreateEntry("info.bin");
+                using (var s = infoEntry.Open())
+                {
+                    MessagePack.MessagePackSerializer.Serialize(s, new StoredObjectInfo(typeof(Pipeline).FullName, Language, Version, Tag), LZ4Standard);
+                }
+
+                var pipeEntry = zip.CreateEntry("pipeline.bin");
+                using(var s = pipeEntry.Open())
+                {
+                    MessagePack.MessagePackSerializer.Serialize(s, Data, LZ4Standard);
+                }
+
+                foreach (var process in Processes)
+                {
+                    var dataProperty = process.GetType().GetProperty(nameof(Spotter.Data)); //Uses spotter just to get the name of the .Data property from StorableObject<,> instead of hard-coding
+                    if (dataProperty is object)
+                    {
+                        if (dataProperty.GetValue(process, null) is StorableObjectData data)
+                        {
+                            var type = data.GetType();
+                            var correctType = Convert.ChangeType(data, type);
+
+                            var entry = zip.CreateEntry(new StoredObjectInfo(process).ToString() + ".bin");
+                            using (var s = entry.Open())
+                            {
+                                MessagePack.MessagePackSerializer.Serialize(s, correctType, LZ4Standard);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        public static async Task<Pipeline> LoadFromPackedAsync(Stream inputStream)
+        {
+            using (var zip = new ZipArchive(inputStream, ZipArchiveMode.Read, leaveOpen: true))
+            {
+                var infoEntry = zip.GetEntry("info.bin");
+                StoredObjectInfo info;
+                using (var s = infoEntry.Open())
+                {
+                    info = MessagePack.MessagePackSerializer.Deserialize<StoredObjectInfo>(s, LZ4Standard);
+                }
+
+                var pipeline = new Pipeline(info.Language, info.Version, info.Tag);
+
+                var pipeEntry = zip.GetEntry("pipeline.bin");
+                using (var s = pipeEntry.Open())
+                {
+                    pipeline.Data = MessagePack.MessagePackSerializer.Deserialize<PipelineData>(s, LZ4Standard);
+                }
+
+                foreach(var process in pipeline.Data.Processes)
+                {
+                    if (ObjectStore.TryGetType(process.ModelType, out var type))
+                    {
+                        object model = null;
+
+                        foreach (var constructorInfo in type.GetConstructors().Concat(type.GetConstructors(BindingFlags.Instance | BindingFlags.NonPublic)))
+                        {
+                            var parameters = constructorInfo.GetParameters();
+                            if (parameters.Length == 3
+                                && parameters[0].ParameterType == typeof(Language)
+                                && parameters[1].ParameterType == typeof(int)
+                                && parameters[2].ParameterType == typeof(string))
+                            {
+                                //Found a good one
+                                model = constructorInfo.Invoke(new object[] { process.Language, process.Version, process.Tag });
+                                break;
+                            }
+
+                            if (parameters.Length == 2
+                                && parameters[0].ParameterType == typeof(Language)
+                                && parameters[1].ParameterType == typeof(int))
+                            {
+                                //Found a good one
+                                model = constructorInfo.Invoke(new object[] { process.Language, process.Version });
+                                break;
+                            }
+                            if (parameters.Length == 1
+                                && parameters[0].ParameterType == typeof(Language))
+                            {
+                                //Found a good one
+                                model = constructorInfo.Invoke(new object[] { process.Language });
+                                break;
+                            }
+                        }
+
+                        var dataProperty = model.GetType().GetProperty(nameof(Spotter.Data)); //Uses spotter just to get the name of the .Data property from StorableObject<,> instead of hard-coding
+                        if(dataProperty is object)
+                        {
+                            var entry = zip.GetEntry(process.ToString() + ".bin");
+                            using (var s = entry.Open())
+                            using (var ms = new MemoryStream())
+                            {
+                                await s.CopyToAsync(ms);
+                                var bytes = ms.ToArray();
+
+                                var deserializer = SerializationHelper.CreateDeserializer(dataProperty.PropertyType);
+                                var modelData = deserializer.Invoke(bytes);
+
+                                dataProperty.GetSetMethod().Invoke(model, new[] { modelData });
+                            }
+                        }
+
+                        if (model is object)
+                        {
+                            pipeline.Add((IProcess)model);
+                        }
+                    }
+                }
+
+                return pipeline;
+            }
         }
 
         public static async Task<bool> CheckIfHasModelAsync(Language language, int version, string tag, StoredObjectInfo model, bool matchVersion = true)
@@ -80,6 +206,12 @@ namespace Catalyst
 
         public override async Task StoreAsync()
         {
+            UpdateProcessData();
+            await base.StoreAsync();
+        }
+
+        private void UpdateProcessData()
+        {
             Data.Processes = new List<StoredObjectInfo>();
             var set = new HashSet<string>();
             foreach (var p in Processes)
@@ -90,7 +222,6 @@ namespace Catalyst
                     Data.Processes.Add(md);
                 }
             }
-            await base.StoreAsync();
         }
 
         public void AddSpecialCase(string word, TokenizationException exception)
@@ -195,12 +326,39 @@ namespace Catalyst
             }
         }
 
+        public async Task<Pipeline> AddAsync(Task<IProcess> modelLoadTask) => Add(await modelLoadTask);
+
         public Pipeline Add(IProcess process)
         {
             RWLock.EnterWriteLock();
             try
             {
-                Processes.Add(process);
+                //Ensure correct order when adding new processes
+
+                var normalizers       = Processes.Where(p => p is INormalizer).ToList();
+                var tokenizers        = Processes.Where(p => p is ITokenizer).ToList();
+                var sentenceDetectors = Processes.Where(p => p is ISentenceDetector).ToList();
+                var others            = Processes.Except(normalizers).Except(tokenizers).Except(sentenceDetectors).ToList();
+
+                if (process is INormalizer)
+                {
+                    normalizers.Add(process);
+                }
+                else if (process is ITokenizer)
+                {
+                    tokenizers.Add(process);
+                }
+                else if (process is ISentenceDetector)
+                {
+                    sentenceDetectors.Add(process);
+                }
+                else
+                {
+                    others.Add(process);
+                }
+
+                Processes = normalizers.Concat(tokenizers).Concat(sentenceDetectors).Concat(others).ToList();
+
                 TryImportSpecialCases(process);
             }
             finally
@@ -215,7 +373,7 @@ namespace Catalyst
             RWLock.EnterWriteLock();
             try
             {
-                Data.Processes = newPipeline.Data.Processes;
+                Data.Processes = newPipeline.Data.Processes.ToList();
                 Processes = newPipeline.Processes.ToList();
                 Version = newPipeline.Version;
             }
@@ -227,81 +385,70 @@ namespace Catalyst
 
         public static Pipeline For(Language language, bool sentenceDetector = true, bool tagger = true)
         {
-            var p = new Pipeline(language);
-            p.Add(new FastTokenizer(language));
-            if (sentenceDetector) { p.Add(SentenceDetector.FromStoreAsync(language, -1, "").WaitResult()); }
-            if (tagger) { p.Add(AveragePerceptronTagger.FromStoreAsync(language, -1, "").WaitResult()); }
-            return p;
+            return ForAsync(language, sentenceDetector, tagger).WaitResult();
         }
 
         public static async Task<Pipeline> ForAsync(Language language, bool sentenceDetector = true, bool tagger = true)
         {
-            var p = new Pipeline(language);
-            p.Add(new FastTokenizer(language));
-            if (sentenceDetector) { p.Add(await SentenceDetector.FromStoreAsync(language, 0, "")); }
-            if (tagger) { p.Add(await AveragePerceptronTagger.FromStoreAsync(language, 0, "")); }
+            var p = await TokenizerForAsync(language, sentenceDetector);
+            if (tagger && language != Language.Any && language != Language.Unknown) { p.Add(await AveragePerceptronTagger.FromStoreAsync(language, 0, "")); }
             return p;
         }
 
-        public static async Task<Pipeline> For(IEnumerable<Language> languages, bool sentenceDetector = true, bool tagger = true)
+        public static async Task<Pipeline> ForManyAsync(IEnumerable<Language> languages, bool sentenceDetector = true, bool tagger = true)
         {
             var processes = new List<IProcess>();
             foreach (var language in languages)
             {
-                processes.Add(new FastTokenizer(language));
-                if (sentenceDetector) { processes.Add(await SentenceDetector.FromStoreAsync(language, -1, "")); }
+                var tmp = await TokenizerForAsync(language, sentenceDetector);
+                processes.AddRange(tmp.Processes);
                 if (tagger) { processes.Add(await AveragePerceptronTagger.FromStoreAsync(language, -1, "")); }
             }
             var p = new Pipeline(processes) { Language = Language.Any };
             return p;
         }
 
-        public static async Task<Pipeline> TokenizerFor(Language language)
+        public static Pipeline TokenizerFor(Language language, bool sentenceDetector = true)
+        {
+            return TokenizerForAsync(language, sentenceDetector).WaitResult();
+        }
+
+        public static async Task<Pipeline> TokenizerForAsync(Language language, bool sentenceDetector = true)
         {
             var p = new Pipeline() { Language = language };
             p.Add(new FastTokenizer(language));
 
-            IProcess sd = null;
+            if (sentenceDetector)
+            {
+                IProcess sd = null;
 
-            try
-            {
-                //Uses english sentence detector as a default
-                sd = await SentenceDetector.FromStoreAsync((language == Language.Any) ? Language.English : language, -1, "");
-                p.Add(sd);
-            }
-            catch
-            {
-                Logger.LogWarning("Could not find sentence detector model for language {LANGUAGE}. Falling back to english model", language);
-            }
-
-            if (sd is null)
-            {
                 try
                 {
-                    sd = await SentenceDetector.FromStoreAsync(Language.English, -1, "");
+                    //Uses english sentence detector as a default
+                    sd = await SentenceDetector.FromStoreAsync((language == Language.Any) ? Language.English : language, -1, "");
                     p.Add(sd);
                 }
                 catch
                 {
-                    Logger.LogWarning("Could not find sentence detector model for language {LANGUAGE}. Continuing without one", Language.English);
+                    Logger.LogWarning("Could not find sentence detector model for language {LANGUAGE}. Falling back to english model", language);
+                }
+
+                if (sd is null)
+                {
+                    try
+                    {
+                        sd = await SentenceDetector.FromStoreAsync(Language.English, -1, "");
+                        p.Add(sd);
+                    }
+                    catch
+                    {
+                        Logger.LogWarning("Could not find sentence detector model for language {LANGUAGE}. Continuing without one", Language.English);
+                    }
                 }
             }
 
             return p;
         }
-
-        //TODO: FIX THIS TO HAVE SAME FALLBACK TO ENGLISH FOR SENTENCE DETECTOR
-        //public static async Task<Pipeline> TokenizerFor(IEnumerable<Language> languages)
-        //{
-        //    var processes = new List<IProcess>();
-        //    foreach (var language in languages)
-        //    {
-        //        processes.Add(new SimpleTokenizer(language));
-        //        processes.Add(await SentenceDetector.FromStoreAsync(language, 0, "").WaitResult());
-        //    }
-        //    var p = new Pipeline(processes) { Language = Language.Any};
-        //    return p;
-        //}
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public IDocument ProcessSingle(IDocument document)
@@ -473,19 +620,21 @@ namespace Catalyst
             }
         }
 
-        public IEnumerable<(StoredObjectInfo Model, string[] EntityTypes)> GetPossibleEntityTypes()
+        public IReadOnlyList<(StoredObjectInfo Model, string[] EntityTypes)> GetPossibleEntityTypes()
         {
             RWLock.EnterReadLock();
             try
             {
+                var list = new List<(StoredObjectInfo Model, string[] EntityTypes)>();
                 foreach (var p in Processes)
                 {
                     if (p is IEntityRecognizer ire)
                     {
                         var md = new StoredObjectInfo(ire);
-                        yield return (md, ire.Produces());
+                        list.Add((md, ire.Produces()));
                     }
                 }
+                return list;
             }
             finally
             {

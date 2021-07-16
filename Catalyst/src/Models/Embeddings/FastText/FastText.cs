@@ -1,83 +1,24 @@
-﻿using UID;
-using MessagePack;
-using Microsoft.Extensions.Logging;
-using Mosaik.Core;
-using System;
+﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Linq.Expressions;
 using System.Numerics;
 using System.Runtime.CompilerServices;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using MessagePack;
+using Microsoft.Extensions.Logging;
+using Mosaik.Core;
+using UID;
 
 namespace Catalyst.Models
 {
-
-    [FormerName("Mosaik.NLU.Models", "VectorizerModel")]
-    public class FastTextData : StorableObjectData
-    {
-        public int Dimensions = 200;
-        public uint Buckets = 2_000_000;
-        public int ContextWindow = 5;
-        public int MinimumCount = 5;
-        public int MinimumNgrams = 3;
-        public int MaximumNgrams = 6;
-        public int MaximumWordNgrams = 1;
-        public int MinimumWordNgramsCounts = 100;
-        public bool StoreTrainingData = false;
-        public double ReusePreviousCorpusFactor;
-
-        public int Epoch = 5;
-        public float LearningRate = 0.05f;
-        public long LearningRateUpdateRate = 100;
-        public int Threads = Environment.ProcessorCount;
-        public int NegativeSamplingCount = 10;
-        public double SamplingThreshold = 1e-4;
-
-        public FastText.ModelType Type;
-        public FastText.LossType Loss;
-        public QuantizationType VectorQuantization;
-
-        #region IgnoreCaseFix
-
-        // This fixes the mistake made in the naming of this variable (invariant case != ignore case).
-        // As we cannot rename here (due to the serialization using keyAsPropertyName:true), we add a second property
-        // that refers to the same underlying variable. As MessagePack reads properties in the order of GetProperties,
-        // this ensures the new one (IgnoreCase) is set before the old one (InvariantCase), so we don't the stored value
-        private bool ignoreCase = true;
-
-        public bool IgnoreCase { get { return ignoreCase; } set { ignoreCase = value; } }
-
-        [Obsolete("Wrong property name, use IgnoreCase instead", true)]
-        public bool InvariantCase { get { return ignoreCase; } set { ignoreCase = value; } }
-
-        #endregion IgnoreCaseFix
-
-        public int EntryCount = 0;
-        public int LabelCount = 0;
-        public int SubwordCount = 0;
-
-        public bool IsTrained = false;
-
-        public Dictionary<int, FastText.Entry> Entries;
-        public Dictionary<int, FastText.Entry> Labels;
-        public Dictionary<uint, int> EntryHashToIndex;
-        public Dictionary<uint, int> LabelHashToIndex;
-        public Dictionary<uint, int> SubwordHashToIndex;
-
-        public ThreadPriority ThreadPriority = ThreadPriority.Normal;
-
-        public FastText.TrainingHistory LastTrainingHistory;
-
-        //public Dictionary<Language, int> LanguageOffset;
-        //public Dictionary<int, int> TranslateTable;
-    }
-
     [FormerName("Mosaik.NLU.Models", "Vectorizer")]
-    public partial class FastText : StorableObject<FastText, FastTextData>
+    public partial class FastText : StorableObject<FastText, FastTextData>, ITrainableModel
     {
         #region Constants
 
@@ -114,19 +55,20 @@ namespace Catalyst.Models
         private int[] NegativeTable;
         private Barrier TrainingBarrier; //Barrier to force all threads to be in sync between Epochs
 
-        private IMatrix Wi;
-        private IMatrix Wo;
+        public IMatrix Wi;
+        public IMatrix Wo;
 
-        private int GradientLength;
-        private int HiddenLength;
-        private int OutputLength;
+        public int GradientLength;
+        public int HiddenLength;
+        public int OutputLength;
 
         private List<List<int>> HS_Paths = new List<List<int>>();
         private List<List<bool>> HS_Codes = new List<List<bool>>();
         private List<HSNode> HS_Tree = new List<HSNode>();
 
-        [ThreadStatic]
-        private ThreadState PredictionMPS;
+        private ObjectPool<ThreadState> ThreadStatePool;
+
+        public TrainingHistory TrainingHistory => Data.TrainingHistory;
 
         public FastText(Language language, int version, string tag) : base(language, version, tag, compress: false)
         {
@@ -142,18 +84,20 @@ namespace Catalyst.Models
         public override async Task StoreAsync()
         {
             var wiStream = await DataStore.OpenWriteAsync(Language, nameof(FastTextData) + "-Matrix", Version, Tag + "-wi");
-            var woStream = await DataStore.OpenWriteAsync(Language, nameof(FastTextData) + "-Matrix", Version, Tag + "-wo");
 
             wiStream.SetLength(0);
-            woStream.SetLength(0);
 
             Wi.ToStream(wiStream, Data.VectorQuantization);
-            Wo.ToStream(woStream, Data.VectorQuantization);
-
+            wiStream.Flush();
             wiStream.Close();
+            
+
+            var woStream = await DataStore.OpenWriteAsync(Language, nameof(FastTextData) + "-Matrix", Version, Tag + "-wo");
+            woStream.SetLength(0);
+            Wo.ToStream(woStream, Data.VectorQuantization);
+            woStream.Flush();
             woStream.Close();
 
-            //Data.TranslateTable = TranslateTable;
             await base.StoreAsync();
         }
 
@@ -177,16 +121,6 @@ namespace Catalyst.Models
             return deleted;
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private ThreadState GetPredictionState()
-        {
-            if (PredictionMPS is null)
-            {
-                PredictionMPS = new ThreadState(new Line[0], HiddenLength, OutputLength, GradientLength, -1, CancellationToken.None);
-            }
-            return PredictionMPS;
-        }
-
         public bool TryGetTrainingData(out VectorizerTrainingData previousTrainingCorpus)
         {
             previousTrainingCorpus = null;
@@ -204,32 +138,40 @@ namespace Catalyst.Models
             }
         }
 
-        public new static async Task<FastText> FromStoreAsync(Language language, int version, string tag)
+        public void CompactSupervisedModel()
         {
-            return await FromStoreAsync_Internal(language, version, tag, bufferedMatrix: false);
+            if (Data.Type == ModelType.Supervised)
+            {
+                if (Data.Entries is object)
+                {
+                    foreach (var key in Data.Entries.Keys.ToArray())
+                    {
+                        var entry = Data.Entries[key];
+                        entry.Word = null;
+                        Data.Entries[key] = entry;
+                    }
+                }
+            }
         }
 
-        public static async Task<FastText> FromStoreAsync_Internal(Language language, int version, string tag, bool bufferedMatrix)
+        public new static async Task<FastText> FromStoreAsync(Language language, int version, string tag)
+        {
+            return await FromStoreAsync_Internal(language, version, tag);
+        }
+
+        public static async Task<FastText> FromStoreAsync_Internal(Language language, int version, string tag)
         {
             var a = new FastText(language, version, tag);
             await a.LoadDataAsync();
 
             (Stream wiStream, Stream woStream) = await a.GetMatrixStreamsAsync();
 
-            if (bufferedMatrix)
-            {
-                a.Wi = new BufferedMatrix(wiStream, a.Data.VectorQuantization, 10_000);
-                a.Wo = new BufferedMatrix(woStream, a.Data.VectorQuantization, 10_000);
-            }
-            else
-            {
-                a.Wi = Matrix.FromStream(wiStream, a.Data.VectorQuantization);
-                a.Wo = Matrix.FromStream(woStream, a.Data.VectorQuantization);
-                wiStream.Close();
-                woStream.Close();
-            }
+            a.Wi = Matrix.FromStream(wiStream, a.Data.VectorQuantization);
+            wiStream.Close();
 
-            //a.TranslateTable = a.Data.TranslateTable;
+            a.Wo = Matrix.FromStream(woStream, a.Data.VectorQuantization);
+            woStream.Close();
+            
             a.GradientLength = a.Data.Dimensions;
             a.HiddenLength = a.Data.Dimensions;
             if (a.Data.Type == ModelType.Supervised)
@@ -240,6 +182,8 @@ namespace Catalyst.Models
             {
                 a.OutputLength = a.Data.EntryCount;
             }
+
+            a.NumberOfTokens = a.Data.EntryHashToIndex?.Count ?? 0;
             a.InitializeEntries();
             return a;
         }
@@ -266,10 +210,10 @@ namespace Catalyst.Models
                     //do nothing, will try a different name
                 }
             }
-            throw new FileNotFoundException();
+            throw new FileNotFoundException(nameof(FastTextData) + "-Matrix");
         }
 
-        public void Train(IEnumerable<IDocument> documents, Func<IToken, bool> ignorePattern = null, ParallelOptions parallelOptions = default, VectorizerTrainingData previousTrainingCorpus = null)
+        public void Train(IEnumerable<IDocument> documents, Func<IToken, bool> ignorePattern = null, ParallelOptions parallelOptions = default, VectorizerTrainingData previousTrainingCorpus = null, Action<TrainingUpdate> trainingStatus = null)
         {
             InputData inputData;
             CancellationToken cancellationToken = parallelOptions?.CancellationToken ?? default;
@@ -288,13 +232,102 @@ namespace Catalyst.Models
 
                 using (var m = new Measure(Logger, "Training vector model " + (Vector.IsHardwareAccelerated ? "using hardware acceleration [" + Vector<float>.Count + "]" : "without hardware acceleration"), inputData.docCount))
                 {
-                    DoTraining(inputData, cancellationToken, previousTrainingCorpus);
+                    BeginTraining(inputData, cancellationToken, previousTrainingCorpus, trainingStatus);
                 }
             }
         }
 
-        public void DoTraining(InputData ID, CancellationToken cancellationToken, VectorizerTrainingData previousTrainingCorpus = null)
+        public void AutoTuneTrain(IEnumerable<IDocument> trainDocuments, IEnumerable<IDocument> testDocuments, AutoTuneOptions options, Func<IToken, bool> ignorePattern = null, ParallelOptions parallelOptions = default, CancellationToken cancellationTokenForAutoTune = default, Action<TrainingUpdate> trainingStatus = null, Action<string> autoTuneStep = null)
         {
+            if (Data.Type != ModelType.Supervised) throw new Exception("Autotrain is only supported for supervised (i.e. classification) models. Set Data.Type = ModelType.Supervised before calling it.");
+
+            InputData inputData;
+            CancellationToken cancellationToken = parallelOptions?.CancellationToken ?? default;
+            using (var scope = Logger.BeginScope($"Training Vectorizer '{Tag}' of type {Data.Type} from documents"))
+            {
+                using (var m = new Measure(Logger, "Document parsing", 1))
+                {
+                    inputData = ProcessDocuments(trainDocuments, ignorePattern, parallelOptions);
+                    m.SetOperations(inputData.docCount);
+                }
+
+                int iterations = 0;
+                using (var m = new Measure(Logger, "Autotunning model"))
+                {
+                    var autotune = new AutoTune(Data, options);
+                    float? overallBestF1 = null;
+
+                    do
+                    {
+                        autotune.ResetDataForTraining();
+                        
+                        autoTuneStep?.Invoke(autotune.GetCurrent());
+
+                        m.EmitPartial(autotune.GetCurrent());
+
+                        using (var m2 = new Measure(Logger, "Training vector model " + (Vector.IsHardwareAccelerated ? "using hardware acceleration [" + Vector<float>.Count + "]" : "without hardware acceleration"), inputData.docCount))
+                        {
+                            BeginTraining(inputData, cancellationToken, null, trainingStatus);
+                        }
+
+                        using (new Measure(Logger, "Computing test predictions"))
+                        {
+                            var predTest = testDocuments.AsParallel().Select(d => (Doc: d, Pred: Predict(d))).ToDictionary(d => d.Doc, d => d.Pred);
+                            var stats   = ComputeStats(predTest);
+                            var currentBestF1 = stats.Max(v => v.F1);
+
+                            if(overallBestF1 is null || overallBestF1 < currentBestF1)
+                            {
+                                overallBestF1 = currentBestF1;
+                                autotune.StoreBest(overallBestF1);
+                            }
+
+                            iterations++;
+                            m.SetOperations(iterations).EmitPartial($"\n\n-------------------------\n\nMeasured F1= {currentBestF1}\nOverall best F1 = {overallBestF1}\n\n-------------------------\n\n");
+                        }
+                    } while (autotune.Next(cancellationTokenForAutoTune));
+                }
+            }
+        }
+
+        private static (float Cutoff, float Precision, float Recall, float F1)[] ComputeStats(Dictionary<IDocument, Dictionary<string, float>> predictions)
+        {
+            return Enumerable.Range(40, 20)
+                             .Select(i => i / 100f) //Cutoff range: 0.4f to 0.6f
+                             .Select(cutoff =>
+                                (Cutoff: cutoff,
+                                Predictions: predictions.Select(kv =>
+                                {
+                                    return (TruePositive: kv.Key.Labels.Count(lbl => kv.Value.TryGetValue(lbl, out var score) && score > cutoff),
+                                            FalsePositive: kv.Value.Count(pred => pred.Value > cutoff && !kv.Key.Labels.Contains(pred.Key)),
+                                            Count: kv.Key.Labels.Count);
+                                })
+                                     .ToArray()
+                                )
+                             )
+                             .Select(results =>
+                             {
+                                 var TP = (float)results.Predictions.Sum(r => r.TruePositive);
+                                 var FP = (float)results.Predictions.Sum(r => r.FalsePositive);
+                                 var precision = TP / (TP + FP);
+                                 var recall = TP / (results.Predictions.Sum(r => r.Count));
+                                 return (Cutoff: results.Cutoff, Precision: precision, Recall: recall, F1: 2 * (precision * recall) / (precision + recall));
+                             })
+                             .ToArray();
+        }
+
+
+        //This is an internal method, but is exposed because it is used externally with a custom input data processing
+        public void BeginTraining(InputData ID, CancellationToken cancellationToken, VectorizerTrainingData previousTrainingCorpus, Action<TrainingUpdate> trainingStatus)
+        {
+            // If there are no documents to process then we can't perform any training (maybe documents WERE provided to the Train method but they all had to be ignored for one reason or another - eg. wrong language)
+            if (ID.docCount < 1)
+                return;
+
+            TokenCount = 0;
+            PartialTokenCount = 0;
+            NumberOfTokens = 0;
+
             cancellationToken.ThrowIfCancellationRequested();
 
             ThreadState[] modelPrivateState;
@@ -314,8 +347,9 @@ namespace Catalyst.Models
             {
                 var threads = modelPrivateState.Select(mps =>
                                                             {
-                                                                var t = new Thread(() => ThreadTrain(mps));
+                                                                var t = new Thread(() => ThreadTrain(mps, trainingStatus));
                                                                 t.Priority = Data.ThreadPriority;
+                                                                t.IsBackground = true; // 2020-05-12 DWR: Set to background so that if work is still going on on this thread when the host app is killed, the thread doesn't hold up the shutdown
                                                                 t.Start();
                                                                 return t;
                                                             }).ToArray();
@@ -329,12 +363,12 @@ namespace Catalyst.Models
             {
                 using (var m = new Measure(Logger, "Quantizing results", Wi.Rows + Wo.Rows))
                 {
-                    for (int r = 0; r < Wi.Rows; r++) { Quantize(ref Wi.GetRowRef(r)); }
-                    for (int r = 0; r < Wo.Rows; r++) { Quantize(ref Wo.GetRowRef(r)); }
+                    for (int r = 0; r < Wi.Rows; r++) { Quantize(Wi.GetRow(r)); }
+                    for (int r = 0; r < Wo.Rows; r++) { Quantize(Wo.GetRow(r)); }
                 }
             }
 
-            Data.LastTrainingHistory = trainingHistory;
+            Data.TrainingHistory = trainingHistory;
             Data.IsTrained = true;
         }
 
@@ -398,6 +432,12 @@ namespace Catalyst.Models
 
             if (Data.Type != ModelType.PVDM) { throw new Exception("GetDocumentVector can only be used on PVDM models"); }
 
+
+            if (doc.UID.IsNotNull() && TryGetLabelVector(doc.UID.ToString(), out vector))
+            {
+                return true;
+            }
+
             if (doc.Language != Language)
             {
                 vector = default;
@@ -405,7 +445,7 @@ namespace Catalyst.Models
                 /*throw new Exception($"Document language '{doc.Language}'does not match model language '{Language}'");*/
             }
 
-            var tokens = doc.SelectMany(span => span.GetTokenized()).ToArray();
+            var tokens = doc.SelectMany(span => span.GetCapturedTokens()).ToArray();
 
             var tokenHashes = new List<uint>(tokens.Length);
 
@@ -430,7 +470,7 @@ namespace Catalyst.Models
                 vector = default;
                 return false;
             }
-            var mps = GetPredictionState();
+            var mps = ThreadStatePool.Rent();
 
             for (int i = 0; i < tries; i++)
             {
@@ -441,20 +481,22 @@ namespace Catalyst.Models
                     predictedVector[j] = (float)(ThreadSafeFastRandom.NextDouble()) * (2 * a) - a;
                 }
 
-                TokenCount = tokenIndexes.Length;
                 mps.NumberOfExamples = 0;
                 mps.Loss = 0f;
 
                 for (int epoch = 0; epoch < Data.Epoch; epoch++)
                 {
                     float lr = Data.LearningRate * (1.0f - (float)epoch / (Data.Epoch));
-                    PredictPVDM(ref predictedVector, mps, ref line, lr);
+                    PredictPVDM(predictedVector, mps, ref line, lr);
                 }
 
-                SIMD.Add(ref averageVector, ref predictedVector);
+                SIMD.Add(averageVector, predictedVector);
             }
-            SIMD.Multiply(ref averageVector, 1f / tries);
+            SIMD.Multiply(averageVector, 1f / tries);
             vector = averageVector;
+
+            ThreadStatePool.Return(mps);
+
             return true;
         }
 
@@ -481,19 +523,8 @@ namespace Catalyst.Models
             var ngrams = GetEntrySubwords(index);
             if (ngrams.Length > 0)
             {
-                if (Wi is BufferedMatrix) //Doesn't support GetRowByRef
-                {
-                    foreach (var ngram in ngrams)
-                    {
-                        var ngram_vec = Wi.GetRow(ngram);
-                        SIMD.Add(ref vec, ref ngram_vec);
-                    }
-                }
-                else
-                {
-                    foreach (var ngram in ngrams) { SIMD.Add(ref vec, ref Wi.GetRowRef(ngram)); }
-                }
-                SIMD.Multiply(ref vec, 1f / ngrams.Length);
+                foreach (var ngram in ngrams) { SIMD.Add(vec, Wi.GetRow(ngram)); }
+                SIMD.Multiply(vec, 1f / ngrams.Length);
             }
             return vec;
         }
@@ -512,9 +543,9 @@ namespace Catalyst.Models
             {
                 foreach (var ngram in subwords)
                 {
-                    SIMD.Add(ref vec, ref Wi.GetRowRef((int)ngram));
+                    SIMD.Add(vec, Wi.GetRow((int)ngram));
                 }
-                SIMD.Multiply(ref vec, 1f / subwords.Count);
+                SIMD.Multiply(vec, 1f / subwords.Count);
             }
             return vec;
         }
@@ -533,9 +564,9 @@ namespace Catalyst.Models
             {
                 foreach (var ngram in subwords)
                 {
-                    SIMD.Add(ref vec, ref Wi.GetRowRef((int)ngram));
+                    SIMD.Add(vec, Wi.GetRow((int)ngram));
                 }
-                SIMD.Multiply(ref vec, 1f / subwords.Count);
+                SIMD.Multiply(vec, 1f / subwords.Count);
             }
             return (vec, 0);
         }
@@ -562,13 +593,13 @@ namespace Catalyst.Models
         public int GetWordIndex(string word)
         {
             var pos = GetMostProbablePOSforWord(word);
-            var hash = HashToken(new SingleToken(word, pos, 0, 0, Language), Language);
+            var hash = HashToken(new SingleToken(word, pos, 0, 0, Language, word), Language);
             return Data.EntryHashToIndex.ContainsKey(hash) ? Data.EntryHashToIndex[hash] : -1;
         }
 
         public int GetWordIndex(string word, Language language, PartOfSpeech pos)
         {
-            var hash = HashToken(new SingleToken(word, pos, 0, 0, language), language);
+            var hash = HashToken(new SingleToken(word, pos, 0, 0, language, word), language);
             return Data.EntryHashToIndex.ContainsKey(hash) ? Data.EntryHashToIndex[hash] : -1;
         }
 
@@ -590,28 +621,32 @@ namespace Catalyst.Models
             {
                 foreach (var ngram in subwords)
                 {
-                    SIMD.Add(ref vec, ref Wi.GetRowRef((int)ngram));
+                    SIMD.Add(vec, Wi.GetRow((int)ngram));
                 }
 
-                SIMD.Multiply(ref vec, 1f / subwords.Count);
+                SIMD.Multiply(vec, 1f / subwords.Count);
             }
             return vec;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public void Quantize(ref float[] vector)
+#if NETCOREAPP3_0 || NETCOREAPP3_1 || NET5_0
+        public void Quantize(Span<float> vector)
+#else
+        public void Quantize(float[] vector)
+#endif
         {
             switch (Data.VectorQuantization)
             {
                 case QuantizationType.None: return;
                 case QuantizationType.OneBit:
                 {
-                    SIMD.Quantize1Bit(ref vector);
+                    SIMD.Quantize1Bit(vector);
                     return;
                 }
                 case QuantizationType.TwoBits:
                 {
-                    SIMD.Quantize2Bits(ref vector);
+                    SIMD.Quantize2Bits(vector);
                     return;
                 }
                 case QuantizationType.FourBits:
@@ -643,28 +678,92 @@ namespace Catalyst.Models
 
         public (string label, float score) PredictMax(IDocument doc, int maxTokens = -1)
         {
-            if (Language != Language.Any && doc.Language != Language) { throw new Exception($"Document language ({doc.Language}) not the same as model language ({Language})"); }
-            if (Data.Type != ModelType.Supervised) { throw new Exception("Predict can only be called on Supervised models"); }
-
-            var state = GetPredictionState();
-
-            IEnumerable<IToken> tokens;
-            if (maxTokens <= 0)
+            try
             {
-                tokens = doc.SelectMany(span => span.GetTokenized());
-                maxTokens = doc.TokensCount;
+                if (Language != Language.Any && doc.Language != Language) { throw new Exception($"Document language ({doc.Language}) not the same as model language ({Language})"); }
+                if (Data.Type != ModelType.Supervised) { throw new Exception("Predict can only be called on Supervised models"); }
+
+                var state = ThreadStatePool.Rent();
+
+                IEnumerable<IToken> tokens;
+                if (maxTokens <= 0)
+                {
+                    tokens = doc.SelectMany(span => span.GetCapturedTokens());
+                    maxTokens = doc.TokensCount;
+                }
+                else
+                {
+                    tokens = doc.SelectMany(span => span.GetCapturedTokens()).Take(maxTokens);
+                    maxTokens = Math.Min(maxTokens, doc.TokensCount);
+                }
+
+                var tokenHashes = new List<uint>(maxTokens);
+                var tokenNGramsIndexes = new List<int>(maxTokens);
+                foreach (var tk in tokens)
+                {
+                    if (tk.Value.Length > 0)
+                    {
+                        uint hash = HashToken(tk, Language);
+                        tokenHashes.Add(hash);
+                        var subwords = GetCharNgrams(tk.Value);
+                        subwords = TranslateNgramHashesToIndexes(subwords, Language, create: false);
+                        if (subwords.Any())
+                        {
+                            tokenNGramsIndexes.AddRange(subwords.Select(h => (int)h));
+                        }
+                    }
+                }
+
+                var entries = tokenHashes.Where(hash => Data.EntryHashToIndex.ContainsKey(hash))
+                                         .Select(hash => Data.EntryHashToIndex[hash]).ToArray();
+
+                var wordNgrams = GetWordNGrams(entries, create: false);
+                entries = entries.Concat(wordNgrams).Concat(tokenNGramsIndexes).ToArray();
+
+                if (entries.Length > 0)
+                {
+                    ComputeHidden(state, entries);
+
+                    switch (Data.Loss)
+                    {
+                        case LossType.SoftMax            : ComputeOutputSoftmax(state);        break;
+                        case LossType.NegativeSampling   : ComputeOutputBinaryLogistic(state); break;
+                        case LossType.HierarchicalSoftMax: ComputeOutputBinaryLogistic(state); break;
+                        case LossType.OneVsAll           : ComputeOutputBinaryLogistic(state); break;
+                    }
+
+                    var index = state.Output.Argmax();
+                    var result = (Data.Labels[index].Word, state.Output[index]);
+                    ThreadStatePool.Return(state);
+                    return result;
+                }
+                else
+                {
+                    return (null, float.NaN);
+                }
             }
-            else
+            catch(Exception E)
             {
-                tokens = doc.SelectMany(span => span.GetTokenized()).Take(maxTokens);
-                maxTokens = Math.Min(maxTokens, doc.TokensCount);
+                Logger.LogError(E, "Failed to predict for document with length {LEN}\n{STACK}", doc.Length, E.StackTrace);
+                return (null, float.NaN);
             }
+        }
 
-            var tokenHashes = new List<uint>(maxTokens);
-            var tokenNGramsIndexes = new List<int>(maxTokens);
-            foreach (var tk in tokens)
+        public Dictionary<string, float> Predict(IDocument doc)
+        {
+            var ans = new Dictionary<string, float>(OutputLength);
+
+            try
             {
-                if (tk.Value.Length > 0)
+                if (Language != Language.Any && doc.Language != Language) { throw new Exception($"Document language ({doc.Language}) not the same as model language ({Language})"); }
+                if (Data.Type != ModelType.Supervised) { throw new Exception("Predict can only be called on Supervised models"); }
+
+                var state = ThreadStatePool.Rent();
+                var tokens = doc.SelectMany(span => span.GetCapturedTokens()).ToArray();
+
+                var tokenHashes = new List<uint>(tokens.Length);
+                var tokenNGramsIndexes = new List<int>(tokens.Length);
+                foreach (var tk in tokens)
                 {
                     uint hash = HashToken(tk, Language);
                     tokenHashes.Add(hash);
@@ -675,90 +774,46 @@ namespace Catalyst.Models
                         tokenNGramsIndexes.AddRange(subwords.Select(h => (int)h));
                     }
                 }
-            }
 
-            var entries = tokenHashes.Where(hash => Data.EntryHashToIndex.ContainsKey(hash))
-                                     .Select(hash => Data.EntryHashToIndex[hash]).ToArray();
+                var entries = tokenHashes.Where(hash => Data.EntryHashToIndex.ContainsKey(hash))
+                                         .Select(hash => Data.EntryHashToIndex[hash]).ToArray();
 
-            var wordNgrams = GetWordNGrams(entries, create: false);
-            entries = entries.Concat(wordNgrams).Concat(tokenNGramsIndexes).ToArray();
+                var wordNgrams = GetWordNGrams(entries, create: false);
+                entries = entries.Concat(wordNgrams).Concat(tokenNGramsIndexes).ToArray();
 
-            if (entries.Length > 0)
-            {
-                ComputeHidden(state, entries);
-
-                switch (Data.Loss)
+                if (entries.Length > 0)
                 {
-                    case LossType.SoftMax            : ComputeOutputSoftmax(state);        break;
-                    case LossType.NegativeSampling   : ComputeOutputBinaryLogistic(state); break;
-                    case LossType.HierarchicalSoftMax: ComputeOutputBinaryLogistic(state); break;
-                    case LossType.OneVsAll           : ComputeOutputBinaryLogistic(state); break;
+                    ComputeHidden(state, entries);
+                    switch (Data.Loss)
+                    {
+                        case LossType.SoftMax            : ComputeOutputSoftmax(state);        break;
+                        case LossType.NegativeSampling   : ComputeOutputBinaryLogistic(state); break;
+                        case LossType.HierarchicalSoftMax: ComputeOutputBinaryLogistic(state); break;
+                        case LossType.OneVsAll           : ComputeOutputBinaryLogistic(state); break;
+                    }
                 }
 
-                var index = state.Output.Argmax();
-                return (Data.Labels[index].Word, state.Output[index]);
-            }
-            else
-            {
-                return (null, float.NaN);
-            }
-        }
-
-        public Dictionary<string, float> Predict(IDocument doc)
-        {
-            if (Language != Language.Any && doc.Language != Language) { throw new Exception($"Document language ({doc.Language}) not the same as model language ({Language})"); }
-            if (Data.Type != ModelType.Supervised) { throw new Exception("Predict can only be called on Supervised models"); }
-
-            var state = GetPredictionState();
-            var tokens = doc.SelectMany(span => span.GetTokenized()).ToArray();
-
-            var tokenHashes = new List<uint>(tokens.Length);
-            var tokenNGramsIndexes = new List<int>(tokens.Length);
-            foreach (var tk in tokens)
-            {
-                uint hash = HashToken(tk, Language);
-                tokenHashes.Add(hash);
-                var subwords = GetCharNgrams(tk.Value);
-                subwords = TranslateNgramHashesToIndexes(subwords, Language, create: false);
-                if (subwords.Any())
+                for (int i = 0; i < state.Output.Length; i++)
                 {
-                    tokenNGramsIndexes.AddRange(subwords.Select(h => (int)h));
+                    ans[Data.Labels[i].Word] = state.Output[i];
                 }
+
+                ThreadStatePool.Return(state);
+
             }
-
-            var entries = tokenHashes.Where(hash => Data.EntryHashToIndex.ContainsKey(hash))
-                                     .Select(hash => Data.EntryHashToIndex[hash]).ToArray();
-
-            var wordNgrams = GetWordNGrams(entries, create: false);
-            entries = entries.Concat(wordNgrams).Concat(tokenNGramsIndexes).ToArray();
-
-            if (entries.Length > 0)
+            catch(Exception E)
             {
-                ComputeHidden(state, entries);
-                switch(Data.Loss)
-                {
-                    case LossType.SoftMax:             ComputeOutputSoftmax(state);        break;
-                    case LossType.NegativeSampling:    ComputeOutputBinaryLogistic(state); break;
-                    case LossType.HierarchicalSoftMax: ComputeOutputBinaryLogistic(state); break;
-                    case LossType.OneVsAll:            ComputeOutputBinaryLogistic(state); break;
-                }
+                Logger.LogError(E, "Failed to predict for document with length {LEN}\n{STACK}", doc.Length, E.StackTrace);
             }
-
-            var ans = new Dictionary<string, float>(OutputLength);
-
-            for (int i = 0; i < state.Output.Length; i++)
-            {
-                ans[Data.Labels[i].Word] = state.Output[i];
-            }
-
             return ans;
         }
 
-        private void ThreadTrain(ThreadState state)
+        private void ThreadTrain(ThreadState state, Action<TrainingUpdate> trainingStatus)
         {
             long localTokenCount = 0;
-            Stopwatch Watch = null;
-            if (state.ThreadID == 0) { Watch = Stopwatch.StartNew(); }
+            var sinceEpochWatch = Stopwatch.StartNew();
+            var sinceBeginingWatch = Stopwatch.StartNew();
+
             float progress = 0f, lr = Data.LearningRate;
 
             float baseLR = Data.LearningRate / 200;
@@ -766,7 +821,6 @@ namespace Catalyst.Models
             float nextProgressReport = 0f;
             for (int epoch = 0; epoch < Data.Epoch; epoch++)
             {
-                if (state.CancellationToken.IsCancellationRequested) { return; } //Cancelled the training, so return from the thread
 
                 for (int i = 0; i < state.Corpus.Length; i++)
                 {
@@ -783,6 +837,8 @@ namespace Catalyst.Models
 
                     if (localTokenCount > Data.LearningRateUpdateRate)
                     {
+                        if (state.CancellationToken.IsCancellationRequested) { return; } //Cancelled the training, so return from the thread
+
                         progress = (float)(TokenCount) / (Data.Epoch * NumberOfTokens);
 
                         var x10 = (float)(TokenCount) / (10 * NumberOfTokens);
@@ -799,17 +855,20 @@ namespace Catalyst.Models
 
                         if (state.ThreadID == 0 && progress > nextProgressReport)
                         {
+
                             nextProgressReport += 0.01f; //Report every 1%
                             var loss = state.GetLoss();
-                            var ws = (double)(Interlocked.Exchange(ref PartialTokenCount, 0)) / Watch.Elapsed.TotalSeconds;
-                            Watch.Restart();
+                            var ws = (double)(Interlocked.Exchange(ref PartialTokenCount, 0)) / sinceEpochWatch.Elapsed.TotalSeconds;
+                            sinceEpochWatch.Restart();
                             float wst = (float)(ws / Data.Threads);
 
                             Logger.LogInformation("At {PROGRESS:n1}%, w/s/t: {WST:n0}, w/s: {WS:n0}, loss at epoch {EPOCH}/{MAXEPOCH}: {LOSS:n5}", (progress * 100), wst, ws, epoch + 1, Data.Epoch, loss);
 
-                            state.TrainingHistory.Progress.Add(progress);
-                            state.TrainingHistory.Loss.Add(loss);
-                            state.TrainingHistory.WordsPerSecond.Add(wst);
+                            var update = new TrainingUpdate().At(epoch, Data.Epoch, loss)
+                                                             .Processed(Interlocked.Read(ref TokenCount), sinceBeginingWatch.Elapsed);
+                            state.TrainingHistory.Append(update);
+
+                            trainingStatus?.Invoke(update);
                         }
                     }
                 }
@@ -817,7 +876,7 @@ namespace Catalyst.Models
             }
             if (state.ThreadID == 0)
             {
-                state.TrainingHistory.ElapsedSeconds = (float)Watch.Elapsed.TotalSeconds;
+                state.TrainingHistory.ElapsedTime = sinceBeginingWatch.Elapsed;
             }
         }
 
@@ -833,6 +892,7 @@ namespace Catalyst.Models
             var bow = new List<int>();
             int len = l.Length;
             int cw = Data.ContextWindow;
+            bool useWNG = Data.CBowUseWordNgrams;
             if (len < cw * 2) { return; }
             for (int w = 0; w < len; w++)
             {
@@ -849,6 +909,20 @@ namespace Catalyst.Models
                             {
                                 bow.Add(ng);
                             }
+                        }
+                    }
+
+                    if (useWNG)
+                    {
+                        if(w > contextSize)
+                        {
+                            var wng_before = GetWordNGrams(l.AsSpan().Slice(w - contextSize, contextSize), false);
+                            bow.AddRange(wng_before);
+                        }
+                        if(w < len - contextSize)
+                        {
+                            var wng_after = GetWordNGrams(l.AsSpan().Slice(w + 1, contextSize), false);
+                            bow.AddRange(wng_after);
                         }
                     }
 
@@ -934,7 +1008,7 @@ namespace Catalyst.Models
                     }
                 }
 
-                AppendWordNGrams(ref bow, create: false);
+                AppendWordNGrams(bow, create: false);
 
                 bow.AddRange(l.Labels);
 
@@ -942,8 +1016,11 @@ namespace Catalyst.Models
                 Update(mps, bow_a, l.EntryIndexes[w], lr);
             }
         }
-
-        private void PredictPVDM(ref float[] predictionVector, ThreadState mps, ref Line l, float lr)
+#if NETCOREAPP3_0 || NETCOREAPP3_1 || NET5_0
+        private void PredictPVDM(Span<float> predictionVector, ThreadState mps, ref Line l, float lr)
+#else
+        private void PredictPVDM(float[] predictionVector, ThreadState mps, ref Line l, float lr)
+#endif
         {
             int cw = Data.ContextWindow;
             int len = l.EntryIndexes.Length - cw;
@@ -959,10 +1036,10 @@ namespace Catalyst.Models
                     }
                 }
 
-                AppendWordNGrams(ref bow, create: false);
+                AppendWordNGrams(bow, create: false);
 
                 var bow_a = bow.ToArray();
-                UpdatePredictionOnly(ref predictionVector, mps, ref bow_a, l.EntryIndexes[w], lr);
+                UpdatePredictionOnly(predictionVector, mps, bow_a, l.EntryIndexes[w], lr);
             }
         }
 
@@ -981,12 +1058,12 @@ namespace Catalyst.Models
 
             if (Data.Type == ModelType.Supervised || Data.Type == ModelType.PVDM)
             {
-                SIMD.Multiply(ref state.Gradient, 1.0f / input.Length);
+                SIMD.Multiply(state.Gradient, 1.0f / input.Length);
             }
 
             foreach (var ix in input)
             {
-                Wi.AddToRow(ref state.Gradient, ix);
+                Wi.AddToRow(state.Gradient, ix);
             }
         }
 
@@ -1001,21 +1078,25 @@ namespace Catalyst.Models
 
             state.Loss += ComputeOneVsAllLoss(state, targets, lr);
 
-            SIMD.Multiply(ref state.Gradient, 1.0f / input.Length);
+            SIMD.Multiply(state.Gradient, 1.0f / input.Length);
 
             foreach (var ix in input)
             {
-                Wi.AddToRow(ref state.Gradient, ix);
+                Wi.AddToRow(state.Gradient, ix);
             }
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void UpdatePredictionOnly(ref float[] predictionVector, ThreadState state, ref int[] input, int target, float lr)
+#if NETCOREAPP3_0 || NETCOREAPP3_1 || NET5_0
+        private void UpdatePredictionOnly(Span<float> predictionVector, ThreadState state, Span<int> input, int target, float lr)
+#else
+        private void UpdatePredictionOnly(float[] predictionVector, ThreadState state, Span<int> input, int target, float lr)
+#endif
         {
             if (input.Length == 0) { return; }
             state.NumberOfExamples++;
 
-            ComputeHiddenForPrediction(ref state.Hidden, ref input, ref predictionVector);
+            ComputeHiddenForPrediction(state.Hidden, input, predictionVector);
 
             switch (Data.Loss)
             {
@@ -1024,9 +1105,9 @@ namespace Catalyst.Models
                 case LossType.SoftMax:             { state.Loss += ComputeSoftmax(state, target, lr, addToOutput: false);             break; }
             }
 
-            SIMD.Multiply(ref state.Gradient, 1.0f / (input.Length + 1));
+            SIMD.Multiply(state.Gradient, 1.0f / (input.Length + 1));
 
-            SIMD.Add(ref predictionVector, ref state.Gradient);
+            SIMD.Add(predictionVector, state.Gradient);
         }
 
         private void SetTargetCounts(List<long> counts)
@@ -1045,6 +1126,12 @@ namespace Catalyst.Models
 
         private void InitializeTableNegatives(List<long> counts)
         {
+            if (counts.Count < 2)
+            {
+                // If we don't perform this check and there is only a single label specified then the GetNegative method will get stuck in an infinite loop
+                throw new Exception("It will not be possible to use NegativeSampling without specifying multiple labels");
+            }
+
             double z = 0.0;
             var negatives = new List<int>();
             for (int i = 0; i < counts.Count; i++)
@@ -1156,20 +1243,12 @@ namespace Catalyst.Models
         private float BinaryLogistic(ThreadState state, int target, bool label, float lr, bool addToOutput = true)
         {
             var v = Wo.GetRow(target);
-            Quantize(ref v);
-            float score = state.Sigmoid(Wo.DotRow(ref state.Hidden, ref v));
+            Quantize(v);
+            float score = state.Sigmoid(Wo.DotRow(state.Hidden, v));
 
             float alpha = lr * ((label ? 1.0f : 0f) - score);
 
-            if (Wo is BufferedMatrix)
-            {
-                var tmp = Wo.GetRow(target);
-                SIMD.MultiplyAndAdd(ref state.Gradient, ref tmp, alpha);
-            }
-            else
-            {
-                SIMD.MultiplyAndAdd(ref state.Gradient, ref Wo.GetRowRef(target), alpha);
-            }
+            SIMD.MultiplyAndAdd(state.Gradient, Wo.GetRow(target), alpha); //Don't use the quantized value on purpose here
 
             if (addToOutput)
             {
@@ -1223,7 +1302,7 @@ namespace Catalyst.Models
                 {
                     float label = (i == target) ? 1.0f : 0.0f;
                     float alpha = lr * (label - state.Output[i]);
-                    SIMD.Add(ref state.Gradient, ref Wo.GetRowRef(i));
+                    SIMD.Add(state.Gradient, Wo.GetRow(i));
 
                     Wo.AddToRow(state.Hidden, i, alpha);
                 }
@@ -1235,15 +1314,15 @@ namespace Catalyst.Models
         private void ComputeOutputSoftmax(ThreadState state)
         {
             float z = 0.0f;
-            ref float[] hidden = ref state.Hidden;
-            ref float[] output = ref state.Output;
+            float[] hidden = state.Hidden;
+            float[] output = state.Output;
 
             for (int i = 0; i < output.Length; i++)
             {
-                output[i] = Wo.DotRow(ref hidden, i);
+                output[i] = Wo.DotRow(hidden, i);
             }
 
-            float max = SIMD.Max(ref output);
+            float max = SIMD.Max(output);
 
             for (int i = 0; i < output.Length; i++)
             {
@@ -1251,53 +1330,63 @@ namespace Catalyst.Models
                 z += output[i];
             }
             z = 1.0f / z;
-            SIMD.Multiply(ref output, z);
+            SIMD.Multiply(output, z);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void ComputeOutputBinaryLogistic(ThreadState state)
         {
-            ref float[] hidden = ref state.Hidden;
-            ref float[] output = ref state.Output;
+            float[] hidden = state.Hidden;
+            float[] output = state.Output;
             for (int i = 0; i < output.Length; i++)
             {
-                output[i] = Wo.DotRow(ref hidden, i);
-                output[i] = state.Sigmoid(output[i]);
+                output[i] = state.Sigmoid(Wo.DotRow(hidden, i));
             }
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void ComputeHidden(ThreadState state, Span<int> input)
         {
-            float z = 1.0f / (float)input.Length;
-            ref float[] hidden = ref state.Hidden;
+            float z = 1.0f / input.Length;
+#if NETCOREAPP3_0 || NETCOREAPP3_1 || NET5_0
+            Span<float> hidden = state.Hidden;
+            hidden.Fill(0f);
+#else
+            float[] hidden = state.Hidden;
             hidden.Zero();
+#endif
             foreach (var ix in input)
             {
                 var v = Wi.GetRow(ix);
-                Quantize(ref v);
-                SIMD.Add(ref hidden, ref v);
+                Quantize(v);
+                SIMD.Add(hidden, v);
             }
-            SIMD.Multiply(ref hidden, z);
+            SIMD.Multiply(hidden, z);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void ComputeHiddenForPrediction(ref float[] hidden, ref int[] input, ref float[] extraVector)
+#if NETCOREAPP3_0 || NETCOREAPP3_1 || NET5_0
+        private void ComputeHiddenForPrediction(Span<float> hidden, Span<int> input, Span<float> extraVector)
         {
-            float z = 1.0f / (input.Length + 1);
+            hidden.Fill(0f);
+#else
+        private void ComputeHiddenForPrediction(float[] hidden, Span<int> input, Span<float> extraVector)
+        {
             hidden.Zero();
+#endif
+            float z = 1.0f / (input.Length + 1);
             foreach (var ix in input)
             {
                 var v = Wi.GetRow(ix);
-                Quantize(ref v);
-                SIMD.Add(ref hidden, ref v);
+                Quantize(v);
+                SIMD.Add(hidden, v);
             }
 
             var ve = extraVector.ToArray();
-            Quantize(ref ve);
-            SIMD.Add(ref hidden, ref ve);
+            Quantize(ve);
+            SIMD.Add(hidden, ve);
 
-            SIMD.Multiply(ref hidden, z);
+            SIMD.Multiply(hidden, z);
         }
 
         private ThreadState[] Initialize(InputData ID, CancellationToken token, VectorizerTrainingData previousTrainingCorpus = null)
@@ -1333,7 +1422,10 @@ namespace Catalyst.Models
                     }
                     else
                     {
-                        Logger.LogWarning("Hash colision between {ONE} and {TWO}", lbl.Value.Value, Data.Entries[Data.EntryHashToIndex[lbl.Key]].Word);
+                        if(Data.Labels[Data.LabelHashToIndex[lbl.Key]].Word != lbl.Value.Value)
+                        {
+                            Logger.LogWarning("Hash colision between {ONE} and {TWO}", lbl.Value.Value, Data.Labels[Data.LabelHashToIndex[lbl.Key]].Word);
+                        }
                     }
                 }
             }
@@ -1402,6 +1494,10 @@ namespace Catalyst.Models
                     }
 
                     labels = ID.docIDHashes.ContainsKey(di) ? new int[1] { Data.EntryHashToIndex[ID.docIDHashes[di]] } : new int[0];
+                }
+                else if (Data.CBowUseWordNgrams && Data.Type == ModelType.CBow)
+                {
+                    GetWordNGrams(entries, create: true); //create entries on the index, but don't add them to the InputData - they're re-computed on the fly during training
                 }
 
                 trainingCorpus[di] = new Line(entries, labels);
@@ -1533,7 +1629,7 @@ namespace Catalyst.Models
 
                foreach (var span in doc)
                {
-                   var tokens = span.GetTokenized().ToArray();
+                   var tokens = span.GetCapturedTokens().ToArray();
 
                    for (int i = 0; i < tokens.Length; i++)
                    {
@@ -1573,9 +1669,6 @@ namespace Catalyst.Models
                if (Data.Type == ModelType.PVDBow || Data.Type == ModelType.PVDM)
                {
                    string id = doc.UID.ToString();
-                    //if (doc.Metadata.ContainsKey("UID")) { id = doc.Metadata["UID"]; }
-                    //else if (doc.Metadata.ContainsKey("Labels")) { id = doc.Metadata["Labels"]; }
-                    //else { throw new Exception("All documents need to have a UID field to identify them"); /*id = docIndex.ToString();*/ }
                     var hash = HashLabel(id);
                    ID.docIDHashes.TryAdd(docIndex, hash);
                    ID.uniqueIDs.TryAdd(hash, new SingleToken(id, Language));
@@ -1674,6 +1767,8 @@ namespace Catalyst.Models
 
                 m.SetOperations(usedBuckets);
             }
+
+             ThreadStatePool = new ObjectPool<ThreadState>(() => new ThreadState(new Line[0], HiddenLength, OutputLength, GradientLength, -1, CancellationToken.None), 2);
         }
 
         private List<uint> TranslateNgramHashesToIndexes(List<uint> hashes, Language language, bool create = true)
@@ -1696,9 +1791,9 @@ namespace Catalyst.Models
             return indexes;
         }
 
-        private int[] GetWordNGrams(IList<int> list, bool create)
+        public int[] GetWordNGrams(Span<int> list, bool create)
         {
-            int len = list.Count;
+            int len = list.Length;
             var hashes = new List<uint>();
             for (int w = 0; w < len; w++)
             {
@@ -1718,10 +1813,18 @@ namespace Catalyst.Models
                 }
             }
             hashes = TranslateNgramHashesToIndexes(hashes, Language.Any, create);
-            return hashes.Select(h => (int)h).ToArray();
+            
+            //Need to cast back to int
+            var intHashes = new int[hashes.Count];
+            for (int i = 0; i < hashes.Count; i++)
+            {
+                intHashes[i] = (int)hashes[i];
+            }
+
+            return intHashes;
         }
 
-        private void AppendWordNGrams(ref List<int> list, bool create)
+        private void AppendWordNGrams(List<int> list, bool create)
         {
             if (Data.MaximumWordNgrams < 2) { return; }
             int len = list.Count;
@@ -1866,13 +1969,177 @@ namespace Catalyst.Models
             public int docCount;
         }
 
-        [MessagePackObject(keyAsPropertyName: true)]
-        public class TrainingHistory
+        public class AutoTuneOptions
         {
-            public List<float> Progress = new List<float>();
-            public List<float> WordsPerSecond = new List<float>();
-            public List<float> Loss = new List<float>();
-            public float ElapsedSeconds;
+            public TimeSpan MaximumDuration { get; set; } = TimeSpan.FromMinutes(15);
+            public int MaximumTrials { get; set; } = int.MaxValue;
+
+            public bool UpdateEpoch         { get; set; } = true;
+            public bool UpdateLearningRate  { get; set; } = true;
+            public bool UpdateDimensions    { get; set; } = true;
+            public bool UpdateWordNgrams    { get; set; } = true;
+            public bool UpdateBuckets       { get; set; } = true;
+        }
+
+        private class AutoTune
+        {
+            private readonly FastTextData _dataHolder;
+            private readonly AutoTuneOptions _options;
+            private float? _bestMetric;
+            private int _bestEpoch;
+            private float _bestLearningRate;
+            private int _bestDimensions;
+            private int _bestMaximumWordNgrams;
+            private uint _bestBuckets;
+            private Stopwatch _stopWatch;
+            private int _trials = 0;
+            private readonly StringBuilder _description; 
+
+            public AutoTune(FastTextData data, AutoTuneOptions options)
+            {
+                _dataHolder = data;
+                _options = options;
+                _stopWatch = Stopwatch.StartNew();
+                _description = new StringBuilder();
+                StoreBest(null);
+            }
+
+            public bool Next(CancellationToken cancellationToken)
+            {
+                _trials++;
+
+                if (_stopWatch.ElapsedMilliseconds >= _options.MaximumDuration.TotalMilliseconds || _trials >= _options.MaximumTrials || cancellationToken.IsCancellationRequested)
+                {
+                    GetBest();
+                    return false;
+                }
+
+                float t1 = (float)_stopWatch.ElapsedMilliseconds / (float)_options.MaximumDuration.TotalMilliseconds;
+                float t2 = (float)_trials / (float)_options.MaximumTrials;
+                float t = Math.Max(t1, t2);
+
+                _description.Clear();
+                _description.Append("Autotunning model, at ").Append(Math.Round(100*t,1)).Append("%").AppendLine().AppendLine();
+
+                if (_bestMetric.HasValue)
+                {
+                    _description.Append("Best metric = ").Append(_bestMetric).AppendLine();
+
+                    if (_options.UpdateEpoch)
+                    {
+                        _description.Append("\tEpoch = ").Append(_bestEpoch).AppendLine();
+                    }
+
+                    if (_options.UpdateLearningRate)
+                    {
+                        _description.Append("\tLearning Rate = ").Append(_bestLearningRate).AppendLine();
+                    }
+
+                    if (_options.UpdateDimensions)
+                    {
+                        _description.Append("\tDimensions = ").Append(_bestDimensions).AppendLine();
+                    }
+
+                    if (_options.UpdateWordNgrams)
+                    {
+                        _description.Append("\tMaximum Word Ngrams = ").Append(_bestMaximumWordNgrams).AppendLine();
+                    }
+
+                    if (_options.UpdateBuckets)
+                    {
+                        _description.Append("\tBuckets = ").Append(_bestBuckets).AppendLine();
+                    }
+                    _description.AppendLine();
+                }
+
+
+                _description.Append("Now training with:").AppendLine();
+
+                if (_options.UpdateEpoch)
+                {
+                    _dataHolder.Epoch = (int)UpdateArgGauss(_bestEpoch, 5, 100, 2.8f, 2.5f, t, false);
+                    _description.Append("\tEpoch = ").Append(_dataHolder.Epoch).AppendLine();
+                }
+
+                if (_options.UpdateLearningRate)
+                {
+                    _dataHolder.LearningRate = (float)Math.Round(UpdateArgGauss(_bestLearningRate, 0.01f, 1f, 1.9f, 1.0f, t, false), 3);
+                    _description.Append("\tLearning Rate = ").Append(_dataHolder.LearningRate).AppendLine();
+                }
+
+                if (_options.UpdateDimensions)
+                {
+                    _dataHolder.Dimensions = (int)(Math.Ceiling(UpdateArgGauss(_bestDimensions, 96, 512, 1.4f, 0.3f, t, false) / 16) * 16);
+                    _description.Append("\tDimensions = ").Append(_dataHolder.Dimensions).AppendLine();
+                }
+
+                if (_options.UpdateWordNgrams)
+                {
+                    _dataHolder.MaximumWordNgrams = (int)UpdateArgGauss(_bestMaximumWordNgrams, 1, 5, 4.3f, 2.4f, t, true);
+                    _description.Append("\tMaximum Word Ngrams = ").Append(_dataHolder.MaximumWordNgrams).AppendLine();
+                }
+
+                if (_options.UpdateBuckets)
+                {
+                    _dataHolder.Buckets = (uint)(Math.Ceiling(UpdateArgGauss(_bestBuckets, 100_000, 5_000_000, 2.0f, 1.5f, t, false) / 10_000)* 10_000);
+                    _description.Append("\tBuckets = ").Append(_dataHolder.Buckets).AppendLine();
+                }
+
+                return true;
+            }
+
+            public string GetCurrent()
+            {
+                return _description.ToString();
+            }
+
+            public void StoreBest(float? metric)
+            {
+                _bestMetric            = metric;
+                _bestEpoch             = _dataHolder.Epoch;
+                _bestLearningRate      = _dataHolder.LearningRate;
+                _bestDimensions        = _dataHolder.Dimensions;
+                _bestMaximumWordNgrams = _dataHolder.MaximumWordNgrams;
+                _bestBuckets           = _dataHolder.Buckets;
+            }
+
+            public void GetBest()
+            {
+                _dataHolder.Epoch              =  _bestEpoch;
+                _dataHolder.LearningRate       =  _bestLearningRate;
+                _dataHolder.Dimensions         =  _bestDimensions;
+                _dataHolder.MaximumWordNgrams  =  _bestMaximumWordNgrams;
+                _dataHolder.Buckets            =  _bestBuckets;
+            }
+
+            public float UpdateArgGauss(float val, float min, float max, float startSigma, float endSigma, float t, bool linear)
+            {
+                return Math.Min(Math.Max(GetArgGauss(val, startSigma, endSigma, t, linear), min), max);
+            }
+
+            private float GetArgGauss(float val, float startSigma, float endSigma, float t, bool linear)
+            {
+                var stdDev = startSigma -((startSigma - endSigma) / 0.5) * Math.Min(0.5, Math.Max((t - 0.25), 0.0));
+                var mean = 0.0;
+                
+                var u1 = 1.0 - ThreadSafeRandom.NextDouble();
+                var u2 = 1.0 - ThreadSafeRandom.NextDouble();
+                var coeff = mean + stdDev * (Math.Sqrt(-2.0 * Math.Log(u1)) * Math.Sin(2.0 * Math.PI * u2));
+                var updateCoeff = linear ? coeff : Math.Pow(2.0, coeff);
+                return (float)(linear ? (updateCoeff + val) : (updateCoeff * val));
+            }
+
+            internal void ResetDataForTraining()
+            {
+                _dataHolder.EntryCount = 0;
+                _dataHolder.LabelCount = 0;
+                _dataHolder.SubwordCount = 0;
+                _dataHolder.EntryHashToIndex = new Dictionary<uint, int>();
+                _dataHolder.Entries = new Dictionary<int, Entry>();
+                _dataHolder.SubwordHashToIndex = new Dictionary<uint, int>();
+                _dataHolder.LabelHashToIndex = new Dictionary<uint, int>();
+                _dataHolder.Labels = new Dictionary<int, Entry>();
+            }
         }
     }
 }

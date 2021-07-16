@@ -30,7 +30,7 @@ namespace Catalyst.Models
 
         public string Value { get => throw new NotImplementedException(); set => throw new NotImplementedException(); }
 
-        public string TokenizedValue => throw new NotImplementedException();
+        public string TokenizedValue(bool mergeEntities = false) => throw new NotImplementedException();
 
         public UID128 UID { get => throw new NotImplementedException(); set => throw new NotImplementedException(); }
 
@@ -57,6 +57,8 @@ namespace Catalyst.Models
         public int TokensCount => throw new NotImplementedException();
 
         public int EntitiesCount => throw new NotImplementedException();
+
+        public bool IsParsed => throw new NotImplementedException();
 
         public ISpan AddSpan(int begin, int end)
         {
@@ -88,7 +90,7 @@ namespace Catalyst.Models
             throw new NotImplementedException();
         }
 
-        public void WriteAsJson(JsonTextWriter jw)
+        public void WriteAsJson(IJsonWriter jw)
         {
             throw new NotImplementedException();
         }

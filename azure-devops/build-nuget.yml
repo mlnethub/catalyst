@@ -1,17 +1,39 @@
 variables:
   solution: '**/*.sln'
   project:  './Catalyst/Catalyst.csproj'
+  projectSpacy:  './Catalyst.Spacy/Catalyst.Spacy.csproj'
+  projectWordNet:  './Catalyst.WordNet/Catalyst.WordNet.csproj'
   buildPlatform: 'Any CPU'
   buildConfiguration: 'Release'
 
 trigger:
-- master
+  branches:
+    include:
+    - master
+  paths:
+    exclude:
+    - Languages
+    - samples
+    - Catalyst.Training
+    - Catalyst.WordNet.Test
+    - tests
+    - azure-devops/build-models.yml
 
 pool:
-  vmImage: 'VS2017-Win2016'
+  vmImage: 'windows-latest'
 
 steps:
-- task: NuGetToolInstaller@0
+- checkout: self
+  lfs: false #for this build we don't need LFS support
+
+- task: NuGetToolInstaller@1
+
+- task: UseDotNet@2
+  displayName: 'Use .NET Core sdk'
+  inputs:
+    packageType: sdk
+    version: 5.0.102
+    installationPath: $(Agent.ToolsDirectory)/dotnet
 
 - task: DotNetCoreCLI@2
   inputs:
@@ -23,17 +45,49 @@ steps:
   inputs:
     command: 'build'
     projects: '$(project)'
-    arguments: '-c $(buildConfiguration) /p:Version=0.0.$(build.buildId)  /p:AllowUnsafeBlocks=True /p:LangVersion=latest'
+    arguments: '-c $(buildConfiguration) /p:Version=1.0.$(build.buildId)  /p:AllowUnsafeBlocks=True /p:LangVersion=latest'
+
+- task: DotNetCoreCLI@2
+  inputs:
+    command: 'build'
+    projects: '$(projectSpacy)'
+    arguments: '-c $(buildConfiguration) /p:Version=1.0.$(build.buildId)  /p:AllowUnsafeBlocks=True /p:LangVersion=latest'
+
+- task: DotNetCoreCLI@2
+  inputs:
+    command: 'build'
+    projects: '$(projectWordNet)'
+    arguments: '-c $(buildConfiguration) /p:Version=1.0.$(build.buildId)  /p:AllowUnsafeBlocks=True /p:LangVersion=latest'
 
 - task: DotNetCoreCLI@2
   inputs:
     command: 'pack'
     packagesToPack: '$(project)'
     versioningScheme: 'off'
-    buildProperties: 'Version="0.0.$(build.buildId)";AllowUnsafeBlocks="True";LangVersion="latest"'
+    configuration: 'Release'
+    buildProperties: 'Version="1.0.$(build.buildId)";AllowUnsafeBlocks="True";LangVersion="latest"'
     verbosityPack: 'Diagnostic'
     nobuild: true
 
+- task: DotNetCoreCLI@2
+  inputs:
+    command: 'pack'
+    packagesToPack: '$(projectSpacy)'
+    versioningScheme: 'off'
+    configuration: 'Release'
+    buildProperties: 'Version="1.0.$(build.buildId)";AllowUnsafeBlocks="True";LangVersion="latest"'
+    verbosityPack: 'Diagnostic'
+    nobuild: true
+
+- task: DotNetCoreCLI@2
+  inputs:
+    command: 'pack'
+    packagesToPack: '$(projectWordNet)'
+    versioningScheme: 'off'
+    configuration: 'Release'
+    buildProperties: 'Version="1.0.$(build.buildId)";AllowUnsafeBlocks="True";LangVersion="latest"'
+    verbosityPack: 'Diagnostic'
+    nobuild: true
 
 - task: NuGetCommand@2
   inputs:

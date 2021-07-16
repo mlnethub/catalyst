@@ -8,6 +8,7 @@ using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
+using UID;
 
 namespace Catalyst.Models
 {
@@ -18,32 +19,16 @@ namespace Catalyst.Models
         public string CaptureTag { get; set; }
         public Dictionary<int, TokenizationException> TokenizerExceptions { get; set; } = new Dictionary<int, TokenizationException>();
         public bool IgnoreOnlyNumeric { get; set; }
-
-        #region IgnoreCaseFix
-
-        // This fixes the mistake made in the naming of this variable (invariant case != ignore case).
-        // As we cannot rename here (due to the serialization using keyAsPropertyName:true), we add a second property
-        // that refers to the same underlying variable. As MessagePack reads properties in the order of GetProperties,
-        // this ensures the new one (IgnoreCase) is set before the old one (InvariantCase), so we don't the stored value
-        private bool ignoreCase;
-
-        public bool IgnoreCase { get { return ignoreCase; } set { ignoreCase = value; } }
-
-        [Obsolete("Wrong property name, use IgnoreCase instead", true)]
-        public bool InvariantCase { get { return ignoreCase; } set { ignoreCase = value; } }
-
-        #endregion IgnoreCaseFix
+        public bool IgnoreCase { get; set; }
     }
 
-    public class Spotter : StorableObject<Spotter, SpotterModel>, IEntityRecognizer, IProcess, IHasSpecialCases
+    public class Spotter : StorableObjectV2<Spotter, SpotterModel>, IEntityRecognizer, IProcess, IHasSpecialCases
     {
         public string CaptureTag => Data.CaptureTag;
 
         public bool IgnoreCase { get { return Data.IgnoreCase; } set { Data.IgnoreCase = value; } }
 
         public const string Separator = "_";
-
-        public List<string> TempGazeteer = new List<string>();
 
         private Spotter(Language language, int version, string tag) : base(language, version, tag, compress: false)
         {
@@ -169,8 +154,6 @@ namespace Catalyst.Models
                         var nextHash = Data.IgnoreCase ? IgnoreCaseHash64(next.ValueAsSpan) : Hash64(next.ValueAsSpan);
                         if (Data.MultiGramHashes[n].Contains(nextHash))
                         {
-                            //txt += " " + next.Value;
-                            //var hashTxt = Hash64(txt);
                             hash = HashCombine64(hash, nextHash);
                             if (Data.Hashes.Contains(hash))
                             {
@@ -213,12 +196,18 @@ namespace Catalyst.Models
 
         public void TrainWord2Sense(IEnumerable<IDocument> documents, ParallelOptions parallelOptions, int ngrams = 3, double tooRare = 1E-5, double tooCommon = 0.1, Word2SenseTrainingData trainingData = null)
         {
-            if (trainingData == null)
-            {
-                trainingData = new Word2SenseTrainingData();
-            }
+            var hashCount          = new ConcurrentDictionary<ulong, int>(trainingData?.HashCount           ?? new Dictionary<ulong, int>());
+            var senses             = new ConcurrentDictionary<ulong, ulong[]>(trainingData?.Senses          ?? new Dictionary<ulong, ulong[]>());
+            var words              = new ConcurrentDictionary<ulong, string>(trainingData?.Words            ?? new Dictionary<ulong, string>());
+            var shapes             = new ConcurrentDictionary<string, ulong>(trainingData?.Shapes           ?? new Dictionary<string, ulong>());
+            var shapeExamples      = new ConcurrentDictionary<string, string[]>(trainingData?.ShapeExamples ?? new Dictionary<string, string[]>());
 
-            var stopwords = new HashSet<ulong>(StopWords.Spacy.For(Language).Select(w => Data.IgnoreCase ? IgnoreCaseHash64(w.AsSpan()) : Hash64(w.AsSpan())).ToArray());
+            long totalDocCount     = trainingData?.SeenDocuments ?? 0;
+            long totalTokenCount   = trainingData?.SeenTokens ?? 0;
+
+            bool ignoreCase        = Data.IgnoreCase;
+            bool ignoreOnlyNumeric = Data.IgnoreOnlyNumeric;
+            var stopwords          = new HashSet<ulong>(StopWords.Spacy.For(Language).Select(w => ignoreCase ? IgnoreCaseHash64(w.AsSpan()) : Hash64(w.AsSpan())).ToArray());
 
             int docCount = 0, tkCount = 0;
 
@@ -231,25 +220,40 @@ namespace Catalyst.Models
                 {
                     try
                     {
-                        var Previous = new ulong[ngrams];
-                        var Stack = new Queue<ulong>(ngrams);
+                        var stack = new Queue<ulong>(ngrams);
 
                         if (doc.TokensCount < ngrams) { return; } //Ignore too small documents
 
                         Interlocked.Add(ref tkCount, doc.TokensCount);
+                        
                         foreach (var span in doc)
                         {
-                            var tokens = span.GetTokenized().ToArray();
+                            var tokens = span.GetCapturedTokens().ToArray();
 
                             for (int i = 0; i < tokens.Length; i++)
                             {
                                 var tk = tokens[i];
 
-                                var hash = Data.IgnoreCase ? IgnoreCaseHash64(tk.ValueAsSpan) : Hash64(tk.ValueAsSpan);
+                                if (!(tk is Tokens))
+                                {
+                                    var shape = tk.ValueAsSpan.Shape(compact: false);
+                                    shapes.AddOrUpdate(shape, 1, (k, v) => v + 1);
 
-                                bool filterPartOfSpeech = !(tk.POS == PartOfSpeech.ADJ || tk.POS == PartOfSpeech.NOUN || tk.POS == PartOfSpeech.PROPN);
+                                    shapeExamples.AddOrUpdate(shape, (k) => new[] { tk.Value }, (k, v) =>
+                                    {
+                                        if (v.Length < 50)
+                                        {
+                                            v = v.Concat(new[] { tk.Value }).Distinct().ToArray();
+                                        }
+                                        return v;
+                                    });
+                                }
 
-                                bool skipIfHasUpperCase = (!Data.IgnoreCase && !tk.ValueAsSpan.IsAllLowerCase());
+                                var hash = ignoreCase ? IgnoreCaseHash64(tk.ValueAsSpan) : Hash64(tk.ValueAsSpan);
+
+                                bool filterPartOfSpeech = !(tk.POS == PartOfSpeech.ADJ || tk.POS == PartOfSpeech.NOUN);
+
+                                bool skipIfHasUpperCase = (!ignoreCase && !tk.ValueAsSpan.IsAllLowerCase());
 
                                 bool skipIfTooSmall = (tk.Length < 3);
 
@@ -262,34 +266,37 @@ namespace Catalyst.Models
                                                            tk.ValueAsSpan.IndexOfAny(new char[] { 't', 'h', 's', 't', 'r', 'd' }, 0) >= 0 &&
                                                            tk.ValueAsSpan.IndexOfAny(new char[] { 'a', 'b', 'c', 'e', 'f', 'g', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'u', 'v', 'w', 'x', 'y', 'z' }, 0) < 0);
 
-                                bool skipThisToken = filterPartOfSpeech || skipIfHasUpperCase || skipIfTooSmall || skipIfNotAllLetterOrDigit || skipIfStopWordOrEntity || skipIfMaybeOrdinal;
+                                bool skipIfOnlyNumeric = ignoreOnlyNumeric ? !tk.ValueAsSpan.IsLetter() : false;
+
+                                //Only filter for POS if language != any, as otherwise we won't have the POS information
+                                bool skipThisToken = (filterPartOfSpeech && Language != Language.Any) || skipIfHasUpperCase || skipIfTooSmall || skipIfNotAllLetterOrDigit || skipIfStopWordOrEntity || skipIfMaybeOrdinal || skipIfOnlyNumeric;
 
                                 if (skipThisToken)
                                 {
-                                    Stack.Clear();
+                                    stack.Clear();
                                     continue;
                                 }
 
-                                if (!trainingData.Words.ContainsKey(hash)) { trainingData.Words[hash] = Data.IgnoreCase ? tk.Value.ToLowerInvariant() : tk.Value; }
+                                if (!words.ContainsKey(hash)) { words[hash] = ignoreCase ? tk.Value.ToLowerInvariant() : tk.Value; }
 
-                                Stack.Enqueue(hash);
-                                ulong combined = Stack.ElementAt(0);
+                                stack.Enqueue(hash);
+                                ulong combined = stack.ElementAt(0);
 
-                                for (int j = 1; j < Stack.Count; j++)
+                                for (int j = 1; j < stack.Count; j++)
                                 {
-                                    combined = HashCombine64(combined, Stack.ElementAt(j));
-                                    if (trainingData.HashCount.ContainsKey(combined))
+                                    combined = HashCombine64(combined, stack.ElementAt(j));
+                                    if (hashCount.ContainsKey(combined))
                                     {
-                                        trainingData.HashCount[combined]++;
+                                        hashCount[combined]++;
                                     }
                                     else
                                     {
-                                        trainingData.Senses[combined] = Stack.Take(j + 1).ToArray();
-                                        trainingData.HashCount[combined] = 1;
+                                        senses[combined] = stack.Take(j + 1).ToArray();
+                                        hashCount[combined] = 1;
                                     }
                                 }
 
-                                if (Stack.Count > ngrams) { Stack.Dequeue(); }
+                                if (stack.Count > ngrams) { stack.Dequeue(); }
                             }
                         }
 
@@ -297,8 +304,7 @@ namespace Catalyst.Models
 
                         if (count % 1000 == 0)
                         {
-                            var mem = GC.GetTotalMemory(false);
-                            Logger.LogInformation("[MEM: {MEMORY} MB]  Training Word2Sense model - at {DOCCOUNT} documents, {TKCOUNT} tokens - elapsed {ELAPSED} seconds at {KTKS} kTk/s)", Math.Round(mem / 1048576.0, 2), docCount, tkCount, sw.Elapsed.TotalSeconds, (tkCount / sw.ElapsedMilliseconds));
+                            Logger.LogInformation("Training Word2Sense model - at {DOCCOUNT} documents, {TKCOUNT} tokens - elapsed {ELAPSED} seconds at {KTKS} kTk/s)", docCount, tkCount, sw.Elapsed.TotalSeconds, (tkCount / sw.ElapsedMilliseconds));
                         }
                     }
                     catch (Exception E)
@@ -318,26 +324,40 @@ namespace Catalyst.Models
 
             Logger.LogInformation("Finish parsing documents for Word2Sense model");
 
-            int thresholdRare = (int)Math.Floor(tooRare * docCount);
-            int thresholdCommon = (int)Math.Floor(tooCommon * docCount);
+            totalDocCount += docCount;
+            totalTokenCount += tkCount;
 
-            var toKeep = trainingData.HashCount.Where(kv => kv.Value >= thresholdRare && kv.Value <= thresholdCommon).OrderByDescending(kv => kv.Value)
-                                  .Select(kv => kv.Key).ToArray();
+            int thresholdRare   = Math.Max(2, (int)Math.Floor(tooRare * totalTokenCount));
+            int thresholdCommon = (int)Math.Floor(tooCommon * totalTokenCount);
+
+            var toKeep = hashCount.Where(kv => kv.Value >= thresholdRare && kv.Value <= thresholdCommon).OrderByDescending(kv => kv.Value)
+                                                .Select(kv => kv.Key).ToArray();
 
             foreach (var key in toKeep)
             {
-                var hashes = trainingData.Senses[key];
-                var count = trainingData.HashCount[key];
-
-                Data.Hashes.Add(key);
-                for (int i = 0; i < hashes.Length; i++)
+                if (senses.TryGetValue(key, out var hashes) && hashCount.TryGetValue(key, out var count))
                 {
-                    if (Data.MultiGramHashes.Count <= i)
+                    Data.Hashes.Add(key);
+                    for (int i = 0; i < hashes.Length; i++)
                     {
-                        Data.MultiGramHashes.Add(new HashSet<ulong>());
+                        if (Data.MultiGramHashes.Count <= i)
+                        {
+                            Data.MultiGramHashes.Add(new HashSet<ulong>());
+                        }
+                        Data.MultiGramHashes[i].Add(hashes[i]);
                     }
-                    Data.MultiGramHashes[i].Add(hashes[i]);
                 }
+            }
+
+            if(trainingData is object)
+            {
+                trainingData.HashCount = new Dictionary<ulong, int>(hashCount);
+                trainingData.Senses = new Dictionary<ulong, ulong[]>(senses);
+                trainingData.Words = new Dictionary<ulong, string>(words);
+                trainingData.SeenDocuments = totalDocCount;
+                trainingData.SeenTokens = totalTokenCount;
+                trainingData.Shapes = new Dictionary<string, ulong>(shapes);
+                trainingData.ShapeExamples = new Dictionary<string, string[]>(shapeExamples);
             }
 
             Logger.LogInformation("Finish training Word2Sense model");
@@ -354,43 +374,61 @@ namespace Catalyst.Models
             }
         }
 
+        public void AddEntry(string entry)
+        {
+            void AddSingleTokenConcept(ulong entryHash)
+            {
+                Data.Hashes.Add(entryHash);
+            }
+
+            if (string.IsNullOrWhiteSpace(entry)) { return; }
+
+
+            if (Data.IgnoreOnlyNumeric && int.TryParse(entry, out _)) { return; } //Ignore pure numerical entries
+
+            var words = entry.Trim().Split(new char[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            if (words.Length == 1)
+            {
+                var hash = Data.IgnoreCase ? Spotter.IgnoreCaseHash64(words[0].AsSpan()) : Spotter.Hash64(words[0].AsSpan());
+                AddSingleTokenConcept(hash);
+
+                if (!words[0].AsSpan().IsLetter())
+                {
+                    Data.TokenizerExceptions[words[0].CaseSensitiveHash32()] = new TokenizationException(null); //Null means don't replace by anything - keep token as is
+                }
+
+                return;
+            }
+
+            ulong combinedHash = 0;
+            for (int n = 0; n < words.Length; n++)
+            {
+                var word_hash = Data.IgnoreCase ? Spotter.IgnoreCaseHash64(words[n].AsSpan()) : Spotter.Hash64(words[n].AsSpan());
+                if (n == 0) { combinedHash = word_hash; } else { combinedHash = Spotter.HashCombine64(combinedHash, word_hash); }
+                if (Data.MultiGramHashes.Count < n + 1)
+                {
+                    Data.MultiGramHashes.Add(new HashSet<ulong>());
+                }
+
+                if (!Data.MultiGramHashes[n].Contains(word_hash))
+                {
+                    Data.MultiGramHashes[n].Add(word_hash);
+                }
+
+                if (!words[n].AsSpan().IsLetter())
+                {
+                    Data.TokenizerExceptions[words[n].CaseSensitiveHash32()] = new TokenizationException(null); //Null means don't replace by anything - keep token as is
+                }
+            }
+
+            AddSingleTokenConcept(combinedHash);
+        }
+
         public void AppendList(IEnumerable<string> words)
         {
             foreach (var word in words)
             {
-                var w = word.Trim();
-
-                if (w.Contains(' '))
-                {
-                    var parts = w.Split(CharacterClasses.WhitespaceCharacters, StringSplitOptions.RemoveEmptyEntries);
-
-                    if (parts.Length < 2) { continue; }
-
-                    var hashes = new ulong[parts.Length];
-                    hashes[0] = Data.IgnoreCase ? IgnoreCaseHash64(parts[0].AsSpan()) : Hash64(parts[0].AsSpan());
-                    ulong combined = hashes[0];
-                    for (int i = 1; i < parts.Length; i++)
-                    {
-                        hashes[i] = Data.IgnoreCase ? IgnoreCaseHash64(parts[i].AsSpan()) : Hash64(parts[i].AsSpan());
-                        combined = HashCombine64(combined, hashes[i]);
-                    }
-
-                    Data.Hashes.Add(combined);
-
-                    for (int i = 0; i < hashes.Length; i++)
-                    {
-                        if (Data.MultiGramHashes.Count <= i)
-                        {
-                            Data.MultiGramHashes.Add(new HashSet<ulong>());
-                        }
-                        Data.MultiGramHashes[i].Add(hashes[i]);
-                    }
-                }
-                else
-                {
-                    var hash = Data.IgnoreCase ? IgnoreCaseHash64(w.AsSpan()) : Hash64(w.AsSpan());
-                    Data.Hashes.Add(hash);
-                }
+                AddEntry(word);
             }
         }
     }
@@ -398,8 +436,12 @@ namespace Catalyst.Models
     [MessagePack.MessagePackObject(keyAsPropertyName: true)]
     public class Word2SenseTrainingData
     {
-        public ConcurrentDictionary<ulong, int> HashCount { get; set; } = new ConcurrentDictionary<ulong, int>();
-        public ConcurrentDictionary<ulong, ulong[]> Senses { get; set; } = new ConcurrentDictionary<ulong, ulong[]>();
-        public ConcurrentDictionary<ulong, string> Words { get; set; } = new ConcurrentDictionary<ulong, string>();
+        public Dictionary<ulong, int> HashCount { get; set; } = new Dictionary<ulong, int>();
+        public Dictionary<ulong, ulong[]> Senses { get; set; } = new Dictionary<ulong, ulong[]>();
+        public Dictionary<ulong, string> Words { get; set; } = new Dictionary<ulong, string>();
+        public Dictionary<string, ulong> Shapes { get; set; } = new Dictionary<string, ulong>();
+        public Dictionary<string, string[]> ShapeExamples { get; set; } = new Dictionary<string, string[]>();
+        public long SeenDocuments { get; set; } = 0;
+        public long SeenTokens { get; set; } = 0;
     }
 }

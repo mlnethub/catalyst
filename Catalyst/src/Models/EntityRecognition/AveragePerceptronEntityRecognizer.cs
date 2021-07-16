@@ -10,6 +10,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using System.Collections.Concurrent;
+using System.IO;
 
 namespace Catalyst.Models
 {
@@ -29,23 +30,10 @@ namespace Catalyst.Models
         public List<HashSet<int>> Gazeteers { get; set; }
         public string[] EntityTypes { get; set; }
 
-        #region IgnoreCaseFix
-
-        // This fixes the mistake made in the naming of this variable (invariant case != ignore case).
-        // As we cannot rename here (due to the serialization using keyAsPropertyName:true), we add a second property
-        // that refers to the same underlying variable. As MessagePack reads properties in the order of GetProperties,
-        // this ensures the new one (IgnoreCase) is set before the old one (InvariantCase), so we don't the stored value
-        private bool ignoreCase;
-
-        public bool IgnoreCase { get { return ignoreCase; } set { ignoreCase = value; } }
-
-        [Obsolete("Wrong property name, use IgnoreCase instead", true)]
-        public bool InvariantCase { get { return ignoreCase; } set { ignoreCase = value; } }
-
-        #endregion IgnoreCaseFix
+        public bool IgnoreCase { get; set; }
     }
 
-    public class AveragePerceptronEntityRecognizer : StorableObject<AveragePerceptronEntityRecognizer, AveragePerceptronEntityRecognizerModel>, IEntityRecognizer, IProcess
+    public class AveragePerceptronEntityRecognizer : StorableObjectV2<AveragePerceptronEntityRecognizer, AveragePerceptronEntityRecognizerModel>, IEntityRecognizer, IProcess
     {
         private int N_Features = 21;
         private int N_Tags;
@@ -67,7 +55,6 @@ namespace Catalyst.Models
             }
         }
 
-        //TODO: Add dictionary of gazeteers per entity type, and add a new feature per entity type refering to the token existing on each gazeteer
         public AveragePerceptronEntityRecognizer(Language language, int version, string tag, string[] entityTypes = null, bool ignoreCase = false) : this(language, version, tag)
         {
             if (entityTypes is object)
@@ -136,6 +123,14 @@ namespace Catalyst.Models
             a.N_Features += 3 * a.Data.Gazeteers.Count;
             return a;
         }
+
+        public override async Task LoadAsync(Stream stream)
+        {
+            await base.LoadAsync(stream);
+            N_Tags = Data.Tags.Length;
+            N_Features += 3 * Data.Gazeteers.Count;
+        }
+
 
         public string SingleOrOutside(IList<EntityType> types)
         {
@@ -399,11 +394,13 @@ namespace Catalyst.Models
                     {
                         for (int j = i + 1; j < span.TokensCount; j++)
                         {
-                            var other_tag = Data.IndexToEntityTag[tags[i]];
+                            if (tags[j] == IndexTagOutside) break;
+                            
+                            var other_tag = Data.IndexToEntityTag[tags[j]];
 
-                            if (other_tag != EntityTag.Inside || other_tag != EntityTag.End) { break; }
+                            if (other_tag != EntityTag.Inside && other_tag != EntityTag.End) { break; }
 
-                            var other_type = Data.IndexToEntityType[tags[i]];
+                            var other_type = Data.IndexToEntityType[tags[j]];
 
                             if (other_type != type) { break; }
 
@@ -612,5 +609,6 @@ namespace Catalyst.Models
         {
             return Data.IgnoreCase ? feature.IgnoreCaseHash32() : feature.CaseSensitiveHash32();
         }
+
     }
 }

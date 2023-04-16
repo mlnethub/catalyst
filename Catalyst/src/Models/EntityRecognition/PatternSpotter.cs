@@ -4,6 +4,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.CompilerServices;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace Catalyst.Models
@@ -32,7 +33,7 @@ namespace Catalyst.Models
             return a;
         }
 
-        public void Process(IDocument document)
+        public void Process(IDocument document, CancellationToken cancellationToken = default)
         {
             RecognizeEntities(document);
         }
@@ -68,7 +69,7 @@ namespace Catalyst.Models
             Data.Patterns.Clear();
         }
 
-        public bool RecognizeEntities(ISpan ispan, bool stopOnFirstFound = false)
+        public bool RecognizeEntities(Span ispan, bool stopOnFirstFound = false)
         {
             var tokens = ispan.ToTokenSpan();
             int N = tokens.Length;
@@ -157,12 +158,15 @@ namespace Catalyst.Models
         public bool IsMatch(Span<Token> tokens, out int consumedTokens)
         {
             int largestMatch = -1;
-            for (int i = 0; i < Patterns.Count; i++)
+            var patterns = Patterns;
+
+            for (int i = 0; i < patterns.Count; i++)
             {
                 var currentToken = 0;
-                for (int j = 0; j < Patterns[i].Length; j++)
+                var innerPattern = patterns[i];
+                for (int j = 0; j < innerPattern.Length; j++)
                 {
-                    var currentPattern = Patterns[i][j];
+                    var currentPattern = innerPattern[j];
                     int ct = currentToken;
                     
                     int maxMatches = currentPattern.MaxMatches;

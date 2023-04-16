@@ -1,6 +1,7 @@
 ﻿using Mosaik.Core;
 using System;
 using System.Linq;
+using System.Threading;
 
 namespace Catalyst.Models
 {
@@ -15,19 +16,19 @@ namespace Catalyst.Models
         public string Tag => "";
         public int Version => 0;
 
-        public void Parse(IDocument document)
+        public void Parse(IDocument document, CancellationToken cancellationToken = default)
         {
             if (!document.Spans.Any())
             {
                 document.AddSpan(0, document.Length - 1);
             }
-            foreach (ISpan s in document.Spans)
+            foreach (Span s in document.Spans)
             {
                 Parse(s);
             }
         }
 
-        public void Parse(ISpan span)
+        public void Parse(Span span, CancellationToken cancellationToken = default)
         {
             var textSpan = span.ValueAsSpan;
             int spanBegin = span.Begin;
@@ -53,9 +54,9 @@ namespace Catalyst.Models
             }
         }
 
-        public void Process(IDocument document)
+        public void Process(IDocument document, CancellationToken cancellationToken = default)
         {
-            Parse(document);
+            Parse(document, cancellationToken);
         }
     }
 }

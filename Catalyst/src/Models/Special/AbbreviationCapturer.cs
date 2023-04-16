@@ -250,44 +250,60 @@ namespace Catalyst.Models
             return text;
         }
 
-        public string[] GetContextForCandidate(Document doc, IToken innerToken)
+        public List<string> GetContextForCandidate(Document doc, IToken innerToken)
         {
             var context = new List<string>(); // We let duplicates happen here, as they contribute to show what are the most important words after
 
-            var b = innerToken.Begin - ContextWindow;
-            var e = innerToken.End + ContextWindow;
+            var contextWindowBegin = innerToken.Begin - ContextWindow;
+            var contextWindowEnd = innerToken.End + ContextWindow;
 
-            if (b < 0) { b = 0; }
-            if (e > doc.Length - 1) { e = doc.Length - 1; }
+            if (contextWindowBegin < 0) { contextWindowBegin = 0; }
+            if (contextWindowEnd > doc.Length - 1) { contextWindowEnd = doc.Length - 1; }
 
             foreach (var s in doc)
             {
-                foreach (var tk in s)
+                bool overlap = s.Begin < contextWindowEnd && contextWindowBegin < s.End;
+
+                if (overlap)
                 {
-                    if (tk.Begin >= b && tk.End < e)
+                    foreach (var tk in s)
                     {
-                        //Almost same filtering as Spotter
-                        bool filterPartOfSpeech = !(tk.POS == PartOfSpeech.ADJ || tk.POS == PartOfSpeech.NOUN || tk.POS == PartOfSpeech.PROPN);
-                        bool skipIfHasUpperCase = !tk.ValueAsSpan.IsAllLowerCase();
-                        bool skipIfTooSmall = (tk.Length < 3);
-                        bool skipIfNotAllLetterOrDigit = !(tk.ValueAsSpan.IsAllLetterOrDigit());
-                        bool skipIfStopWordOrEntity = Stopwords.Contains(tk.ValueAsSpan.IgnoreCaseHash64()) || tk.EntityTypes.Any();
-
-                        bool skipIfMaybeOrdinal = (tk.ValueAsSpan.IndexOfAny(new char[] { '1', '2', '3', '4', '5', '6', '7', '8', '9', '0' }, 0) >= 0 &&
-                                                   tk.ValueAsSpan.IndexOfAny(new char[] { 't', 'h', 's', 't', 'r', 'd' }, 0) >= 0 &&
-                                                   tk.ValueAsSpan.IndexOfAny(new char[] { 'a', 'b', 'c', 'e', 'f', 'g', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'u', 'v', 'w', 'x', 'y', 'z' }, 0) < 0);
-
-                        bool skipThisToken = filterPartOfSpeech || skipIfHasUpperCase || skipIfTooSmall || skipIfNotAllLetterOrDigit || skipIfStopWordOrEntity || skipIfMaybeOrdinal;
-
-                        if (!skipThisToken)
+                        if (tk.Begin >= contextWindowBegin && tk.End < contextWindowEnd)
                         {
+                            //Almost same filtering as Spotter
+                            bool filterPartOfSpeech = !(tk.POS == PartOfSpeech.ADJ || tk.POS == PartOfSpeech.NOUN || tk.POS == PartOfSpeech.PROPN);
+
+                            if (filterPartOfSpeech) continue;
+
+                            bool skipIfHasUpperCase = !tk.ValueAsSpan.IsAllLowerCase();
+
+                            if (skipIfHasUpperCase) continue;
+
+                            bool skipIfTooSmall = (tk.Length < 3);
+
+                            if (skipIfTooSmall) continue;
+
+                            bool skipIfNotAllLetterOrDigit = !(tk.ValueAsSpan.IsAllLetterOrDigit());
+
+                            if (skipIfNotAllLetterOrDigit) continue;
+
+                            bool skipIfStopWordOrEntity = Stopwords.Contains(tk.ValueAsSpan.IgnoreCaseHash64()) || tk.EntityTypes.Any();
+
+                            if (skipIfStopWordOrEntity) continue;
+
+                            bool skipIfMaybeOrdinal = (tk.ValueAsSpan.IndexOfAny(new char[] { '1', '2', '3', '4', '5', '6', '7', '8', '9', '0' }, 0) >= 0 &&
+                                                       tk.ValueAsSpan.IndexOfAny(new char[] { 't', 'h', 's', 't', 'r', 'd' }, 0) >= 0 &&
+                                                       tk.ValueAsSpan.IndexOfAny(new char[] { 'a', 'b', 'c', 'e', 'f', 'g', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'u', 'v', 'w', 'x', 'y', 'z' }, 0) < 0);
+
+                            if (skipIfMaybeOrdinal) continue;
+
                             context.Add(tk.Value);
                         }
                     }
                 }
             }
 
-            return context.ToArray();
+            return context;
         }
 
         private static bool IsSubSequenceOf(ReadOnlySpan<char> inner, ReadOnlySpan<char> original)
@@ -309,6 +325,6 @@ namespace Catalyst.Models
     {
         public string Abbreviation { get; set; }
         public string Description { get; set; }
-        public string[] Context { get; set; }
+        public IReadOnlyList<string> Context { get; set; }
     }
 }

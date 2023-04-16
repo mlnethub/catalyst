@@ -10,6 +10,7 @@ using System.Threading.Tasks;
 using System.IO;
 using Microsoft.Extensions.Logging;
 using MessagePack;
+using System.Threading;
 
 namespace Catalyst.Models
 {
@@ -152,21 +153,21 @@ namespace Catalyst.Models
             }
         }
 
-        public (int TP, int FN, int FP) TrainOnSentence(ISpan span, Span<float> ScoreBuffer, Span<int> features)
+        public (int TP, int FN, int FP) TrainOnSentence(Span span, Span<float> ScoreBuffer, Span<int> features)
         {
-            IToken prev = SpecialToken.BeginToken; IToken prev2 = SpecialToken.BeginToken; IToken curr = SpecialToken.BeginToken; IToken next = SpecialToken.BeginToken; IToken next2 = SpecialToken.BeginToken;
+            Token prev = Token.BeginToken; Token prev2 = Token.BeginToken; Token curr = Token.BeginToken; Token next = Token.BeginToken; Token next2 = Token.BeginToken;
             int prevTag = (int)PartOfSpeech.NONE; int prev2Tag = (int)PartOfSpeech.NONE; int currTag = (int)PartOfSpeech.NONE;
 
             int i = 0, correct = 0;
             int TP = 0, FN = 0, FP = 0;
 
-            var en = span.GetEnumerator();
+            var en = span.GetStructEnumerator();
 
-            while (next != SpecialToken.EndToken)
+            while (!next.IsEndToken)
             {
                 prev2 = prev; prev = curr; curr = next; next = next2; prev2Tag = prevTag; prevTag = currTag;
-                if (en.MoveNext()) { next2 = en.Current; } else { next2 = SpecialToken.EndToken; }
-                if (curr != SpecialToken.BeginToken)
+                if (en.MoveNext()) { next2 = en.Current; } else { next2 = Token.EndToken; }
+                if (!curr.IsBeginToken)
                 {
                     int tokenTag = (int)curr.POS;
                     if (!Data.TokenToSingleTag.TryGetValue(curr.IgnoreCaseHash, out currTag))
@@ -186,22 +187,23 @@ namespace Catalyst.Models
             return (TP, FN, FP);
         }
 
-        public void Process(IDocument document)
+        public void Process(IDocument document, CancellationToken cancellationToken = default)
         {
-            Predict(document);
+            Predict(document, cancellationToken);
         }
 
-        public void Predict(IDocument document)
+        public void Predict(IDocument document, CancellationToken cancellationToken = default)
         {
             Span<float> ScoreBuffer = stackalloc float[N_POS];
             Span<int> Features = stackalloc int[N_Features];
             foreach (var span in document)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 Predict(span, ScoreBuffer, Features);
             }
         }
 
-        public void Predict(ISpan span)
+        public void Predict(Span span)
         {
             Span<float> ScoreBuffer = stackalloc float[N_POS];
             Span<int> Features = stackalloc int[N_Features];
@@ -209,21 +211,21 @@ namespace Catalyst.Models
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void Predict(ISpan span, Span<float> ScoreBuffer, Span<int> features)
+        private void Predict(Span span, Span<float> ScoreBuffer, Span<int> features)
         {
-            IToken prev = SpecialToken.BeginToken; IToken prev2 = SpecialToken.BeginToken; IToken curr = SpecialToken.BeginToken; IToken next = SpecialToken.BeginToken; IToken next2 = SpecialToken.BeginToken;
+            Token prev = Token.BeginToken; Token prev2 = Token.BeginToken; Token curr = Token.BeginToken; Token next = Token.BeginToken; Token next2 = Token.BeginToken;
             int prevTag = (int)PartOfSpeech.NONE; int prev2Tag = (int)PartOfSpeech.NONE; int currTag = (int)PartOfSpeech.NONE;
 
             int i = 0;
 
-            var en = span.GetEnumerator();
+            var en = span.GetStructEnumerator();
 
-            while (next != SpecialToken.EndToken)
+            while (!next.IsEndToken)
             {
                 prev2 = prev; prev = curr; curr = next; next = next2; prev2Tag = prevTag; prevTag = currTag;
-                if (en.MoveNext()) { next2 = en.Current; } else { next2 = SpecialToken.EndToken; }
+                if (en.MoveNext()) { next2 = en.Current; } else { next2 = Token.EndToken; }
 
-                if (curr != SpecialToken.BeginToken)
+                if (!curr.IsBeginToken)
                 {
                     if (!Data.TokenToSingleTag.TryGetValue(curr.IgnoreCaseHash, out int tag))
                     {
@@ -454,29 +456,50 @@ namespace Catalyst.Models
         internal sealed class WeightsHolder
         {
             private readonly float[] _weights;
+            private float[] _zero;
             private readonly int _singleWeightLength;
             private readonly Dictionary<int, int> _positions;
+            private readonly int _maxIndex;
 
             public WeightsHolder(Dictionary<int, float[]> weights)
             {
-                _weights = new float[weights.Values.Sum(v => v.Length)];
                 _singleWeightLength = weights.First().Value.Length;
+                _weights = new float[weights.Values.Sum(v => v.Any(f => f != 0f) ? _singleWeightLength : 0)];
+                
                 _positions = new Dictionary<int, int>(weights.Count);
                 var ws = _weights.AsSpan();
                 int curPos = 0;
+                int maxIndex = 0;
                 foreach(var kv in weights)
                 {
-                    _positions.Add(kv.Key, curPos);
-                    kv.Value.AsSpan().CopyTo(ws.Slice(curPos));
-                    curPos += kv.Value.Length;
+                    if (kv.Value.Any(v => v != 0f))
+                    {
+                        _positions.Add(kv.Key, curPos);
+                        kv.Value.AsSpan().CopyTo(ws.Slice(curPos));
+                        curPos += kv.Value.Length;
+                    }
+                    maxIndex = Math.Max(kv.Key, maxIndex);
                 }
+                _maxIndex = maxIndex;
             }
 
-            public bool TryGetValue(int index, out Span<float> weights)
+            public bool TryGetValue(int index, out ReadOnlySpan<float> weights)
             {
                 if(_positions.TryGetValue(index, out var start))
                 {
                     weights = _weights.AsSpan(start, _singleWeightLength);
+                    return true;
+                }
+                else if(index <= _maxIndex)
+                {
+                    //Empty value
+                    if(_zero is null)
+                    {
+                        _zero = new float[_singleWeightLength];
+                    }
+
+                    weights = _zero;
+
                     return true;
                 }
                 weights = default;
@@ -486,10 +509,20 @@ namespace Catalyst.Models
             internal Dictionary<int, float[]> GetOriginal()
             {
                 var dict = new Dictionary<int, float[]>();
+
+                for(int i = 0; i <= _maxIndex; i++)
+                {
+                    if (!_positions.ContainsKey(i))
+                    {
+                        dict[i] = new float[_singleWeightLength];
+                    }
+                }
+
                 foreach(var kv in _positions)
                 {
                     dict[kv.Key] = _weights.AsSpan(kv.Value, _singleWeightLength).ToArray();
                 }
+
                 return dict;
             }
         }

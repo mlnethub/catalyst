@@ -36,7 +36,7 @@ namespace Catalyst.Models
             return a;
         }
 
-        public void Process(IDocument document)
+        public void Process(IDocument document, CancellationToken cancellationToken = default)
         {
             RecognizeEntities(document);
         }
@@ -102,7 +102,7 @@ namespace Catalyst.Models
             }
         }
 
-        private bool DoRecognizeEntities(ISpan ispan, bool stopOnFirstFound = false, List<UID128> removedEntityTargetUIDs = null)
+        private bool DoRecognizeEntities(Span ispan, bool stopOnFirstFound = false, List<UID128> removedEntityTargetUIDs = null)
         {
             var tokens = ispan.ToTokenSpan();
             int N = tokens.Length;

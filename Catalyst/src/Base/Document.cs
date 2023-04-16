@@ -121,7 +121,7 @@ namespace Catalyst
 
         internal void ReserveTokens(int spanIndex, int expectedTokenCount)
         {
-            TokensData[spanIndex].Capacity = Math.Max(TokensData[spanIndex].Capacity, expectedTokenCount);
+            TokensData[spanIndex].Capacity = Math.Max(1, Math.Max(TokensData[spanIndex].Capacity, expectedTokenCount));
         }
 
         public List<IToken> ToTokenList()
@@ -180,7 +180,7 @@ namespace Catalyst
             //}
         }
 
-        public ISpan AddSpan(int begin, int end)
+        public Span AddSpan(int begin, int end)
         {
             SpanBounds.Add(new int[] { begin, end });
             TokensData.Add(new List<TokenData>());
@@ -226,11 +226,11 @@ namespace Catalyst
 
         [JsonIgnore]
         [IgnoreMember]
-        public ISpan this[int key] { get { return Spans.ElementAt(key); } set { throw new InvalidOperationException(); } }
+        public Span this[int key] { get { return Spans.ElementAt(key); } set { throw new InvalidOperationException(); } }
 
         [JsonIgnore]
         [IgnoreMember]
-        public IEnumerable<ISpan> Spans
+        public IEnumerable<Span> Spans
         {
             get
             {
@@ -371,7 +371,7 @@ namespace Catalyst
             return tmp.IgnoreCaseHash;
         }
 
-        public IEnumerator<ISpan> GetEnumerator()
+        public IEnumerator<Span> GetEnumerator()
         {
             return Spans.GetEnumerator();
         }

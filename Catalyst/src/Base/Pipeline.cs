@@ -58,7 +58,7 @@ namespace Catalyst
                     }
                     catch (FileNotFoundException)
                     {
-                        Logger.LogError($"Model not found on disk, ignoring: {md.ToString()}");
+                        Logger.LogWarning($"Model not found on disk, ignoring: {md}");
                         pipeline.Data.Processes.Remove(md);
                     }
                 }
@@ -338,7 +338,8 @@ namespace Catalyst
                 var normalizers       = Processes.Where(p => p is INormalizer).ToList();
                 var tokenizers        = Processes.Where(p => p is ITokenizer).ToList();
                 var sentenceDetectors = Processes.Where(p => p is ISentenceDetector).ToList();
-                var others            = Processes.Except(normalizers).Except(tokenizers).Except(sentenceDetectors).ToList();
+                var taggers           = Processes.Where(p => p is ITagger).ToList();
+                var others            = Processes.Except(normalizers).Except(taggers).Except(tokenizers).Except(sentenceDetectors).ToList();
 
                 if (process is INormalizer)
                 {
@@ -347,6 +348,10 @@ namespace Catalyst
                 else if (process is ITokenizer)
                 {
                     tokenizers.Add(process);
+                }
+                else if (process is ITagger)
+                {
+                    taggers.Add(process);
                 }
                 else if (process is ISentenceDetector)
                 {
@@ -357,7 +362,7 @@ namespace Catalyst
                     others.Add(process);
                 }
 
-                Processes = normalizers.Concat(tokenizers).Concat(sentenceDetectors).Concat(others).ToList();
+                Processes = normalizers.Concat(tokenizers).Concat(sentenceDetectors).Concat(taggers).Concat(others).ToList();
 
                 TryImportSpecialCases(process);
             }
@@ -451,12 +456,12 @@ namespace Catalyst
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public IDocument ProcessSingle(IDocument document)
+        public IDocument ProcessSingle(IDocument document, CancellationToken cancellationToken = default)
         {
             RWLock.EnterReadLock();
             try
             {
-                return ProcessSingleWithoutLocking(document);
+                return ProcessSingleWithoutLocking(document, cancellationToken);
             }
             finally
             {
@@ -465,7 +470,7 @@ namespace Catalyst
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private IDocument ProcessSingleWithoutLocking(IDocument document)
+        private IDocument ProcessSingleWithoutLocking(IDocument document, CancellationToken cancellationToken = default)
         {
             if (document.Length > 0)
             {
@@ -482,7 +487,7 @@ namespace Catalyst
             return document;
         }
 
-        public IEnumerable<IDocument> ProcessSingleThread(IEnumerable<IDocument> documents)
+        public IEnumerable<IDocument> ProcessSingleThread(IEnumerable<IDocument> documents, bool throwOnError = false, CancellationToken cancellationToken = default)
         {
             RWLock.EnterReadLock();
 
@@ -500,10 +505,12 @@ namespace Catalyst
                 {
                     foreach (var doc in block)
                     {
+                        cancellationToken.ThrowIfCancellationRequested();
+
                         IDocument d;
                         try
                         {
-                            d = ProcessSingleWithoutLocking(doc);
+                            d = ProcessSingleWithoutLocking(doc, cancellationToken);
 
                             Interlocked.Add(ref spansCount, doc.SpansCount);
                             Interlocked.Add(ref tokensCount, doc.TokensCount);
@@ -517,8 +524,14 @@ namespace Catalyst
                         }
                         catch (Exception E)
                         {
-                            Logger.LogError(E, "Error parsing document");
-                            d = null;
+                            if (throwOnError) 
+                            { 
+                                throw E; 
+                            } 
+                            else
+                            {
+                                d = null;
+                            }
                         }
 
                         if (d is object)
@@ -562,7 +575,7 @@ namespace Catalyst
                         RWLock.EnterReadLock(); //Acquire the read lock only for the duration of the processing, not during the yield return
                         try
                         {
-                            Parallel.ForEach(buffer, parallelOptions, (doc) => ProcessSingleWithoutLocking(doc));
+                            Parallel.ForEach(buffer, parallelOptions, (doc) => ProcessSingleWithoutLocking(doc, parallelOptions.CancellationToken));
                         }
                         finally
                         {
@@ -580,7 +593,7 @@ namespace Catalyst
                 try
                 {
                     //Process any remaining
-                    Parallel.ForEach(buffer, parallelOptions, (doc) => ProcessSingleWithoutLocking(doc));
+                    Parallel.ForEach(buffer, parallelOptions, (doc) => ProcessSingleWithoutLocking(doc, parallelOptions.CancellationToken));
                 }
                 finally
                 {
